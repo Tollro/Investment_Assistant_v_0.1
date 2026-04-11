@@ -1,5 +1,6 @@
 import akshare as ak
 import pandas as pd
+from typing import Literal
 
 def get_stock_list():
     """获取A股上市公司列表"""
@@ -59,24 +60,62 @@ def get_stock_daily_data(symbol, start_date, end_date, adjust="qfq"):
         print(f"获取股票 {symbol} 数据时出错: {e}")
         return None
 
+def get_stock_data(symbol, timescale:Literal["daily", "weekly", "monthly"], start_date, end_date, adjust="qfq"):
+    try:
+
+        if timescale=="daily":
+            # 使用腾讯接口获取数据，symbol格式如 'sz000001' (平安银行)
+            df = ak.stock_zh_a_hist(symbol=symbol, period="daily", start_date=start_date, end_date=end_date, adjust=adjust)
+        elif timescale=="weekly":
+            df = ak.stock_zh_a_hist(symbol=symbol, period="weekly", start_date=start_date, end_date=end_date, adjust=adjust)
+        elif timescale=="monthly":
+            df = ak.stock_zh_a_hist(symbol=symbol, period="monthly", start_date=start_date, end_date=end_date, adjust=adjust)
+        else:
+            print(f"time参数： {timescale} 不符合格式！")
+            return None  
+        
+        if df is None or df.empty:
+            print(f"未获取到股票 {symbol} 的数据")
+            return None
+        
+        # 重命名列以匹配数据库表结构，并添加股票代码列
+        df.rename(columns={
+            'date': 'time',
+            'amount': 'volume',
+        }, inplace=True)
+        df['symbol'] = symbol
+        
+        # 选择并排序需要的列，确保 'time' 是 datetime 类型
+        df = df[['time', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+        df['time'] = pd.to_datetime(df['time'])
+        return df
+    except Exception as e:
+        print(f"获取股票 {symbol} 数据时出错: {e}")
+        return None
+
 # --- 主程序：演示如何获取平安银行（000001）的数据 ---
 if __name__ == "__main__":
-    # 1. 获取股票代码
-    stock_code = get_stock_code("平安银行")
-    if stock_code:
-        print(f"平安银行的代码: {stock_code}")
-        # 2. 获取股票数据
-        stock_df = get_stock_data(symbol=stock_code, start_date="20230101", end_date="20231231", adjust="qfq")
-        if stock_df is not None:
-            print(stock_df.head())
-        else:
-            print("未能获取平安银行数据")
-    else:
-        print("未能获取平安银行代码")
+    # # 1. 获取股票代码
+    # stock_code = get_stock_code("平安银行")
+    # if stock_code:
+    #     print(f"平安银行的代码: {stock_code}")
+    #     # 2. 获取股票数据
+    #     stock_df = get_stock_data(symbol=stock_code, timescale="daily", start_date="20230101", end_date="20231231", adjust="qfq")
+    #     if stock_df is not None:
+    #         print(stock_df.head())
+    #     else:
+    #         print("未能获取平安银行数据")
+    # else:
+    #     print("未能获取平安银行代码")
     
-    print("获取股票列表:")
-    stock_list = get_stock_list()
-    if stock_list is not None:
-        print(stock_list.head())
+    # print("获取股票列表:")
+    # stock_list = get_stock_list()
+    # if stock_list is not None:
+    #     print(stock_list.head())
+    # else:
+    #     print("未能获取股票列表")
+    stock_df = get_stock_data(symbol="sz000001", timescale="daily", start_date="20230101", end_date="20230231", adjust="qfq")
+    if stock_df is not None:
+        print(stock_df.head())
     else:
-        print("未能获取股票列表")
+        print("未能获取平安银行数据")
