@@ -14,28 +14,6 @@ def get_stock_list():
         print(f"获取股票列表时出错: {e}")
         return None
 
-def get_stock_code(name):
-    """根据股票名称获取股票代码"""
-    try:
-        stock_list = get_stock_list()
-        if stock_list is not None:
-            # 查找名称匹配的股票（不区分大小写）
-            match = stock_list[stock_list['name'].str.contains(name, case=False, na=False)]
-            if not match.empty:
-                # 返回第一个匹配的代码，并添加市场前缀
-                code = match.iloc[0]['code']
-                if code.startswith('6'):
-                    return f"sh{code}"
-                else:
-                    return f"sz{code}"
-            else:
-                print(f"未找到股票名称: {name}")
-                return None
-        return None
-    except Exception as e:
-        print(f"获取股票代码时出错: {e}")
-        return None
-
 def get_stock_daily_data(symbol, start_date, end_date, adjust="qfq"):
     """使用AKShare获取股票日线数据，并确保数据类型和字段名与数据库匹配"""
     try:
@@ -54,7 +32,10 @@ def get_stock_daily_data(symbol, start_date, end_date, adjust="qfq"):
         
         # 选择并排序需要的列，确保 'time' 是 datetime 类型
         df = df[['time', 'symbol', 'open', 'high', 'low', 'close', 'volume']]
+        # 剔除完全重复的行
+        df = df.drop_duplicates()
         df['time'] = pd.to_datetime(df['time'])
+        df = df.sort_values('time').reset_index(drop=True)
         return df
     except Exception as e:
         print(f"获取股票 {symbol} 数据时出错: {e}")
