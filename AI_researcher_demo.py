@@ -7,10 +7,10 @@ from langchain.agents.middleware import wrap_tool_call
 from langchain_core.messages import ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from model import create_gpt_call
-from akshare_tools.stock_list_db_tools import query_by_name_keyword as _query_by_name_keyword
-from akshare_tools.akshare_tools import get_stock_daily_data as _get_stock_daily_data
-from akshare_tools.akshare_tools import get_financial_report as _get_financial_report
-from akshare_tools.akshare_tools import get_news_titles as _get_news_titles
+from test.stock_list_db_tools import query_by_name_keyword as _query_by_name_keyword
+from test.akshare_tools import get_stock_daily_data as _get_stock_daily_data
+from test.akshare_tools import get_financial_report as _get_financial_report
+from test.akshare_tools import get_news_titles as _get_news_titles
 from typing import Literal
 from pydantic import BaseModel, Field
 

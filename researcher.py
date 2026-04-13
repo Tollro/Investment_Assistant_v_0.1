@@ -7,14 +7,14 @@ from langchain.agents.middleware import wrap_tool_call
 from langchain_core.messages import ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from model import create_gpt_call
-from akshare_tools.stock_list_db_tools import query_by_name_keyword as _query_by_name_keyword
-from akshare_tools.akshare_tools import get_stock_daily_data as _get_stock_daily_data
-from akshare_tools.akshare_tools import get_financial_report as _get_financial_report
-from akshare_tools.akshare_tools import get_news_titles as _get_news_titles
+from test.stock_list_db_tools import query_by_name_keyword as _query_by_name_keyword
+from test.akshare_tools import get_stock_daily_data as _get_stock_daily_data
+from test.akshare_tools import get_financial_report as _get_financial_report
+from test.akshare_tools import get_news_titles as _get_news_titles
 from typing import Literal
 from pydantic import BaseModel, Field
 
-from graph import GraphState
+from graph import InvestmentState
 
 # class GetStockKlineDataInput(BaseModel):
 #     symbol: str = Field(description="股票代码（必须包含前缀），如 'sz000001'")
@@ -90,7 +90,7 @@ def print_messages_simple(messages):
             print(f"agent回复内容: {msg.content}")
 
 
-def researcher_node(state: GraphState) -> dict:
+def researcher_node(state: InvestmentState) -> dict:
     """
     本节点负责：
     1. 从用户消息中提取意图（股票名称或代码）
@@ -102,14 +102,16 @@ def researcher_node(state: GraphState) -> dict:
 
     # 1. 解析股票名称 -> 代码（简单示意，可用 LLM 提取实体）
     # 这里假设用户输入包含公司名称，调用 get_stock_code
+
+    # 此处查询应放在chatbot节点。根据查询结果数量处理
     stock_name = "国盾"  # 实际应用中可用正则或 LLM 抽取
     stock_codes = _query_by_name_keyword(keyword=stock_name)
     if not stock_codes:
         raise ValueError("未找到对应股票")
     symbol = stock_codes[0]  # 取第一个结果
-
     collected["stock_code"] = symbol
     collected["company_name"] = stock_name  # 实际可从数据库获取全称
+    
 
     # 2. 获取三张财务报表（可异步并发）
     collected["financial_reports"] = {}
