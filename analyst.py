@@ -14,21 +14,20 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
+from langchain_openai import AzureChatOpenAI
 from pydantic import BaseModel, Field
+from model import create_gpt_call
 
 
 # ==================== State 定义 ====================
-class AnalystState(TypedDict):
+class GraphState(TypedDict):
     """
     Analyst Agent 的状态结构。
     假设 Researcher 已填充 market_data 与 fundamental_data。
     """
     messages: Annotated[List[BaseMessage], add_messages]
-    # 以下字段由上游 Researcher 填充（本演示直接写入）
-    market_data: Optional[Dict[str, Any]]          # 包含 OHLCV 列表
-    fundamental_data: Optional[Dict[str, Any]]     # 包含 PE、PB、行业均值等
-    news_titles: Optional[List[str]]               # 新闻标题列表
+    # 结构化收集的数据
+    collected_data: Optional[Dict[str, Any]]
 
 
 # ==================== 模拟数据工具 ====================
@@ -69,6 +68,7 @@ def evaluate_valuation() -> str:
     """
     基于 PE、PB 及行业均值输出估值分位数判断（低估/合理/高估）。
     """
+
     valuation = {
         "PE": 12.5,
         "PE_industry_avg": 15.2,
@@ -106,7 +106,7 @@ def handle_tool_errors(request, handler):
 
 
 # ==================== 构建 Agent ====================
-def create_analyst_agent(model: ChatOpenAI, tools: List, checkpointer=None):
+def create_analyst_agent(model: AzureChatOpenAI, tools: List, checkpointer=None):
     """
     使用 LangGraph 的 create_agent 快速构建 Analyst Agent。
     """
@@ -162,17 +162,8 @@ def print_messages_simple(messages):
 
 # ==================== 演示入口 ====================
 if __name__ == "__main__":
-    import os
 
-    # 初始化 LLM（使用兼容 OpenAI 的接口，此处以本地或第三方 API 为例）
-    # 请根据实际环境配置 base_url 和 api_key
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",        # 或 qwen-plus / deepseek-chat 等
-        temperature=0.2,
-        max_tokens=800,
-        # base_url="https://api.openai.com/v1",   # 按需修改
-        # api_key=os.getenv("OPENAI_API_KEY")
-    )
+    llm = create_gpt_call(temperature=0.2, max_tokens=800)
 
     # 准备 Analyst 专属工具
     tools = [
