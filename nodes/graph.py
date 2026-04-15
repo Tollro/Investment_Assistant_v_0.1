@@ -4,15 +4,38 @@ from langchain_core.messages import BaseMessage
 import re
 
 class InvestmentState(TypedDict):
-    """
-    结构示例：
-    
-    "investment_data":
-    {
-        "stock_code": "sh600519",
-        "stock_name": "贵州茅台酒股份有限公司",
+    # 全局状态
+    messages: Annotated[List[BaseMessage], add_messages]
+    user_query: str
+    intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
 
-        # ----- 行情数据（市场原始数据）-----
+    # ----- 股票标识 -----
+    stock_code: Optional[str]
+    stock_name: Optional[str]
+
+    # ----- 原始采集数据（结构完全匹配示例）-----
+    collected_data: Optional[Dict[str, Any]]  # 内部结构详见注释
+
+    # ----- 中间分析结果 -----
+    technical_indicators: Optional[Dict[str, Any]]
+    fundamental_analysis: Optional[Dict[str, Any]]
+    sentiment_summary: Optional[Dict[str, Any]]
+
+    # ----- 最终输出内容 -----
+    analysis_summary: Optional[str]
+    recommendation: Optional[str]
+    confidence_score: Optional[float]
+    risk_score: Optional[float]
+    risk_factors: Optional[List[str]]
+    final_decision: Optional[str]
+
+    # ----- 流程控制 -----
+    error_info: Optional[str]
+    retry_count: int
+    final_response: Optional[str]
+    """
+    collected_data 字段内部结构说明（类型为 Dict[str, Any] 时的参考）：
+    {
         "market_data": {
             "realtime": {
                 "price": 1680.00,
@@ -22,59 +45,32 @@ class InvestmentState(TypedDict):
                 "low": 1665.00,
                 "timestamp": "2026-04-13 14:30:00"
             },
-            "kline_daily": [],    # dataframe转JSON
-            "kline_weekly": [],   # dataframe转JSON
-            "kline_monthly": []   # dataframe转JSON
+            "kline_daily": [],     # List[Dict]
+            "kline_weekly": [],    # List[Dict]
+            "kline_monthly": []    # List[Dict]
         },
-
-        # ----- 财务报表数据（原始文本或半结构化数据）-----
         "financial_reports": {
-            "balance_sheet": "原始资产负债表DataFrame转JSON",
-            "income_statement": "原始利润表文本DataFrame转JSON",
-            "cash_flow": "原始现金流量表文本DataFrame转JSON",
+            "balance_sheet": [],      # List[Dict]
+            "income_statement": [],   # List[Dict]
+            "cash_flow": [],          # List[Dict]
             "report_date": "2025-12-31"
         },
-
-        # # ----- 新闻舆情数据 -----
         # "news_data": {
-        #     "titles": [
-        #         "贵州茅台一季度净利润增长18%",
-        #         "北向资金连续5日净买入贵州茅台"
-        #     ],
-        #     "key_data": [],   # 存储完整新闻关键数据
-        #     "urls": []
+        #     "titles": [],
+        #     "key_data": [],
+        #     "urls": [],
         #     "source": "eastmoney"
         # },
-
-        # ----- 其他可选扩展数据 -----
-        "industry_avg": {          # 行业均值（用于估值对比）
+        "industry_avg": {
             "pe": 28.5,
             "pb": 5.2,
             "roe": 0.15
         },
-        "index_data": {            # 大盘指数数据（用于β系数计算）
+        "index_data": {
             "sh000001": {"price": 3300.0, "change_pct": 0.5}
         }
     }
     """
-    messages: Annotated[List[BaseMessage], add_messages]
-    user_query: str
-    intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
-    stock_code: Optional[str]
-    stock_name: Optional[str]
-    collected_data: Optional[Dict[str, Any]]
-    technical_indicators: Optional[Dict[str, Any]]
-    fundamental_analysis: Optional[Dict[str, Any]]
-    sentiment_summary: Optional[Dict[str, Any]]
-    analysis_summary: Optional[str]
-    recommendation: Optional[str]
-    confidence_score: Optional[float]
-    risk_score: Optional[float]
-    risk_factors: Optional[List[str]]
-    final_decision: Optional[str]
-    error_info: Optional[str]
-    retry_count: int
-    final_response: Optional[str]
 
 # ---------- 辅助校验函数 ----------
 def validate_stock_code(code: str) -> bool:
@@ -91,3 +87,15 @@ def validate_collected_data(data: Dict) -> bool:
     if "kline_daily" not in market or len(market["kline_daily"]) < 30:
         return False
     return True
+
+# 创建父图、子图
+def build_parent_graph():
+    workflow = StateGraph(InvestmentState)
+
+    researcher_graph = build_researcher_graph()
+    workflow.add_node("researcher", researcher_graph)
+
+    # ...其他节点和边
+    return workflow.compile()
+
+    

@@ -24,9 +24,13 @@ def query_by_code(code):
     conn = sqlite3.connect(DATABASE_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT code, name FROM stock_catalog WHERE code = ?', (normalized_code,))
-    row = cursor.fetchone()
+    rows = cursor.fetchall()
     conn.close()
-    return row
+    if rows:
+        return rows
+    else:
+        print(f"检索不到代码：{code} 的相关信息")
+        return None
 
 
 def query_by_name_keyword(keyword):
@@ -36,7 +40,11 @@ def query_by_name_keyword(keyword):
     cursor.execute('SELECT code, name FROM stock_catalog WHERE name LIKE ?', (f'%{keyword}%',))
     rows = cursor.fetchall()
     conn.close()
-    return rows
+    if rows:
+        return rows
+    else:
+        print(f"检索不到名称：{keyword} 相关信息")
+        return None
 
 def get_all_data(symbol: str, start_date="20241201", end_date="20250101"):
     """
@@ -56,8 +64,6 @@ def get_all_data(symbol: str, start_date="20241201", end_date="20250101"):
         包含股票全面数据的字典
     """
     result = {
-        "stock_code": symbol,
-        "company_name": "",
         "market_data": {
             "realtime": {},
             "kline_daily": [],

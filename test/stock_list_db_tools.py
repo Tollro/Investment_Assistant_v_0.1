@@ -1,5 +1,6 @@
 import sqlite3
 import akshare_tools
+import re
 
 DATABASE_FILE = './db/stock_list.db'
 
@@ -35,6 +36,9 @@ def query_by_name_keyword(keyword):
     conn.close()
     return rows
 
+def clean_string(s: str) -> str:
+    """移除字符串中所有的空白字符（空格、全角空格、制表符、换行符等）"""
+    return re.sub(r'\s+', '', s).strip()
 
 def fetch_and_store_stock_list():
     """获取股票列表并存储到数据库"""
@@ -49,8 +53,8 @@ def fetch_and_store_stock_list():
         
         # 插入数据到表中
         for _, row in stock_list.iterrows():
-            code = normalize_stock_code(row['code'])
-            name = row['name']
+            code = clean_string(normalize_stock_code(row['code']))
+            name = row['name'].replace(" ", "")
             try:
                 cursor.execute('INSERT OR IGNORE INTO stock_catalog (code, name) VALUES (?, ?)', (code, name))
             except Exception as e:
@@ -65,8 +69,7 @@ def fetch_and_store_stock_list():
 
 if __name__ == "__main__":
 
-    # fetch_and_store_stock_list()
+    fetch_and_store_stock_list()
 
-
-    result = query_by_name_keyword("万科")
-    print("查询结果:", result)
+    # result = query_by_name_keyword("万科")
+    # print("查询结果:", result)
