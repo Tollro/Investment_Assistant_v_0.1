@@ -145,7 +145,7 @@ def should_continue(state: ChatBotState) -> Literal["tool_node", "__end__"]:
 def Researcher_Agent() -> CompiledStateGraph:
 
     llm = create_llm(temperature=0.7, max_tokens=1024)
-    tools = [get_by_stock_name, get_by_stock_code]
+    tools = [get_by_stock_keyword, get_by_stock_code]
     llm_with_tools = llm.bind_tools(tools)
 
     tool_node = ToolNode(tools)
