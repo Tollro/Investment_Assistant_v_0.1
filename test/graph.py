@@ -6,6 +6,8 @@ import re
 class InvestmentState(TypedDict):
     """
     结构示例：
+    
+    "investment_data":
     {
         "stock_code": "sh600519",
         "company_name": "贵州茅台酒股份有限公司",

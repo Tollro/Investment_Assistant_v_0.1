@@ -6,7 +6,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import wrap_tool_call
 from langchain_core.messages import ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
-from model import create_gpt_call
+from original_docs.model import create_gpt_call
 from test.stock_list_db_tools import query_by_name_keyword as _query_by_name_keyword
 from test.akshare_tools import get_stock_daily_data as _get_stock_daily_data
 from test.akshare_tools import get_financial_report as _get_financial_report
@@ -14,7 +14,7 @@ from test.akshare_tools import get_news_titles as _get_news_titles
 from typing import Literal
 from pydantic import BaseModel, Field
 
-from graph import InvestmentState
+from test.graph import InvestmentState
 
 # class GetStockKlineDataInput(BaseModel):
 #     symbol: str = Field(description="股票代码（必须包含前缀），如 'sz000001'")

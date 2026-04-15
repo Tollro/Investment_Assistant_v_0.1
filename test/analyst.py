@@ -16,7 +16,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMe
 from langchain_core.tools import tool
 from langchain_openai import AzureChatOpenAI
 from pydantic import BaseModel, Field
-from model import create_gpt_call
+from test.model import create_gpt_call
 
 
 # ==================== State 定义 ====================

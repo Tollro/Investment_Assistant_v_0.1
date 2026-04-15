@@ -4,8 +4,39 @@ import numpy as np
 from datetime import datetime
 import json
 import warnings
+import sqlite3
 warnings.filterwarnings('ignore')
+DATABASE_FILE = './db/stock_list.db'
 
+def normalize_stock_code(code):
+    """将无前缀股票代码转换为带前缀的代码(sh/ sz)。"""
+    if not code:
+        return None
+    code = str(code).strip()
+    if code.startswith(('sh', 'sz')):
+        return code
+    if code.startswith('6'):
+        return f"sh{code}"
+    return f"sz{code}"
+
+def query_by_code(code):
+    normalized_code = normalize_stock_code(code)
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT code, name FROM stock_catalog WHERE code = ?', (normalized_code,))
+    row = cursor.fetchone()
+    conn.close()
+    return row
+
+
+def query_by_name_keyword(keyword):
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+    # 使用 LIKE 进行模糊匹配（% 表示任意字符）
+    cursor.execute('SELECT code, name FROM stock_catalog WHERE name LIKE ?', (f'%{keyword}%',))
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
 
 def get_all_data(symbol: str, start_date="20241201", end_date="20250101"):
     """
