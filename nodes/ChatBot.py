@@ -72,7 +72,7 @@ def get_by_stock_keyword(keyword:str) -> Dict[str, str]:
     """根据股票关键词查找股票代码"""
     row = _query_by_name_keyword(keyword=keyword)
     if len(row) == 1:
-        return {"stock_code":row[0],"stock_name":row[1]}
+        return {"stock_code":row[0][0],"stock_name":row[0][1]}
     else:
         return row
 
@@ -81,7 +81,7 @@ def get_by_stock_code(code:str) -> Dict[str, str]:
     """根据股票代码查找股票名称"""
     row = _query_by_code(code=code)
     if len(row) == 1:
-        return {"stock_code":row[0],"stock_name":row[1]}
+        return {"stock_code":row[0][0],"stock_name":row[0][1]}
     else:
         return row
 
