@@ -8,6 +8,12 @@ class InvestmentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     user_query: str
     intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
+    
+    # ----- Supervisor 流程控制字段 -----
+    needs_clarification: bool          # 是否需要暂停并向用户追问
+    clarification_question: str        # 向用户展示的追问内容
+    current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
+    last_worker: Optional[str]         # 记录最后执行的子图名称，用于断点恢复
 
     # ----- 股票标识 -----
     stock_code: Optional[str]

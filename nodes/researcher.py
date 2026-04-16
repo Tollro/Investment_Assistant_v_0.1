@@ -72,7 +72,7 @@ class ResearcherState(TypedDict):
 
 @tool(args_schema=GetStockAllDataInput)
 def fetch_data(symbol: str, start_date="20250101", end_date="20260101")->dict:
-    """获取指定股票代码在指定日期范围内的全部数据，包括行情、财务等综合信息，输出JSON格式。"""
+    """获取指定股票代码在指定日期范围内的数据，包括行情、财务等综合信息，输出JSON格式。"""
     result = get_all_data(symbol, start_date, end_date)
     return result
 

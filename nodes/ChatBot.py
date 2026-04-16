@@ -67,6 +67,9 @@ class ChatBotState(TypedDict):
     stock_code: Optional[str]
     stock_name: Optional[str]
 
+    # 新增：待处理的回退请求步数
+    pending_rollback: Optional[int]
+
 @tool
 def get_by_stock_keyword(keyword:str) -> Dict[str, str]:
     """根据股票关键词查找股票代码"""
@@ -118,9 +121,9 @@ def call_llm_with_tools(state: ChatBotState, llm_with_tools=None) -> dict:
     
     # 注意！！需要重新写prompt
     system_prompt="""
-        你是一名金融咨询客服，你的任务是：
+        你是一名资深的金融咨询客服，性格阳光乐观积极，你的任务是：
         1. 根据用户的输入判断用户的意图，获得用户想要查询的股票名称或代码，通过查询tools确保用户查询的是一支可查询股票。
-        2. 输出 交给后续的调度器执行相应的操作。
+        2. 输出股票名称和股票代码交给后续的调度器执行相应的操作。
         注意：如果调用工具后获得多个结果，则询问用户希望查询哪一只股票；如果查询不到，则回复f"抱歉，目前没有任何关于 {(填写用户输入的关键词)} 的信息。"
     """
     messages = state["messages"]
@@ -130,7 +133,6 @@ def call_llm_with_tools(state: ChatBotState, llm_with_tools=None) -> dict:
 
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
-
 
 def should_continue(state: ChatBotState) -> Literal["tool_node", "__end__"]:
     """检查最后一条消息，决定下一步去向。"""
@@ -142,7 +144,7 @@ def should_continue(state: ChatBotState) -> Literal["tool_node", "__end__"]:
     # 否则，流程结束
     return END
 
-def Researcher_Agent() -> CompiledStateGraph:
+def ChatBot_Agent() -> CompiledStateGraph:
 
     llm = create_llm(temperature=0.7, max_tokens=1024)
     tools = [get_by_stock_keyword, get_by_stock_code]
@@ -152,7 +154,7 @@ def Researcher_Agent() -> CompiledStateGraph:
 
     workflow = StateGraph(ChatBotState)
     # Use a lambda to pass llm_with_tools to call_llm
-    workflow.add_node("llm", lambda state: call_llm_with_tools(ChatBotState, llm_with_tools=llm_with_tools))
+    workflow.add_node("llm", lambda state: call_llm_with_tools(state, llm_with_tools=llm_with_tools))
     workflow.add_node("tool_node", tool_node)
 
     workflow.add_edge(START, "llm")
@@ -167,15 +169,49 @@ def Researcher_Agent() -> CompiledStateGraph:
     )
     workflow.add_edge("tool_node", "llm")
 
-    Agent = workflow.compile()
+    # 添加检查点，支持多轮对话
+    memory = MemorySaver()
+    Agent = workflow.compile(checkpointer=memory)
     return Agent
 
 
 if __name__ == "__main__":
 
-    Agent = Researcher_Agent()
+    Agent = ChatBot_Agent()
+
+    # 使用固定的 thread_id 来保持同一会话的上下文
+    config = {"configurable": {"thread_id": "session_001"}}
+
+    # 存储轮次索引 -> checkpoint_id
+    round_checkpoints = []  # 列表，索引即为轮次数（0-based）
+
+    print("🤖 金融助手已上线！输入 'exit' 或 'quit' 退出对话。\n")
+
+    while True:
+        user_input = input("👤 您: ").strip()
+        if user_input.lower() in ["exit", "quit", "退出"]:
+            print("👋 再见！")
+            break
+        if not user_input:
+            continue
+
+        # 将用户输入包装成一条新消息并调用图
+        response = Agent.invoke(
+            {"messages": [user_input]},
+            config=config
+        )
+
+        # 只打印最后一条 AI 的回复（通常为 AIMessage）
+        last_message = response["messages"][-1]
+        if hasattr(last_message, "content") and last_message.content:
+            print(f"🤖 助手: {last_message.content}\n")
+        else:
+            # 如果最后一条是工具消息，则往前找 AI 的回复
+            for msg in reversed(response["messages"]):
+                if msg.__class__.__name__ == "AIMessage" and msg.content:
+                    print(f"🤖 助手: {msg.content}\n")
+                    break
 
     # ！！注意：输入全局状态中的stock_code，在上层应用中调用invoke
-    response = Agent.invoke({"messages": ["获取000012从20250401到20250601的所有信息"]})
-    print_messages_simple(response["messages"])
-
+    # response = Agent.invoke({"messages": ["获取000012从20250401到20250601的所有信息"]})
+    # print_messages_simple(response["messages"])
