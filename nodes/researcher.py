@@ -17,11 +17,12 @@ from langchain_core.messages import BaseMessage
 from langgraph.prebuilt import ToolNode
 from typing import TypedDict, Annotated, Optional
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
 from langchain.tools import tool
 from langchain.agents.middleware import wrap_tool_call
 from langchain_core.messages import ToolMessage
 from langchain_openai import AzureChatOpenAI
+from langchain_core.prompts import PromptTemplate
 import os
 
 from typing import Literal
@@ -56,24 +57,31 @@ def print_messages_simple(messages):
         else:
             print(f"agent回复内容: {msg.content}")
 
-class GetStockAllDataInput(BaseModel):
-    symbol: str = Field(description="股票代码（必须包含前缀），如 'sz000001'")
-    start_date: str = Field(description="开始日期，格式 YYYYMMDD")
-    end_date: str = Field(description="结束日期，格式 YYYYMMDD")
-
 class ResearcherState(TypedDict):
     """Researcher Agent State"""
     messages: Annotated[List[BaseMessage], add_messages]
-    # 以下字段将用于同步回全局 InvestmentState
+    fetch_times: int
+
+    # 同步全局 InvestmentState
+    user_query: str
+    intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
+
     stock_code: Optional[str]
     stock_name: Optional[str]
     collected_data: Optional[Dict[str, Any]]
+    data_available: bool
 
+class GetStockAllDataInput(BaseModel):
+    symbol: str = Field(description="股票代码（必须包含前缀），如 'sz000001'")
+    start_date: str = Field(description="开始日期，格式 YYYYMMDD（默认20250601）")
+    end_date: str = Field(description="结束日期，格式 YYYYMMDD（默认20260101）")
 
 @tool(args_schema=GetStockAllDataInput)
-def fetch_data(symbol: str, start_date="20250101", end_date="20260101")->dict:
+def fetch_data(symbol: str, start_date="20250601", end_date="20260101")->dict:
     """获取指定股票代码在指定日期范围内的数据，包括行情、财务等综合信息，输出JSON格式。"""
     result = get_all_data(symbol, start_date, end_date)
+    if result == None:
+        print("\nfetch_data工具调用结果为空")
     return result
 
 @tool
@@ -127,16 +135,29 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
     
     # 注意！！需要重新写prompt
     system_prompt="""
-        你是一名拥有二十年从业经验的专业的股票研究员，接收到调度员的指示搜集信息，你的任务是：
-        1. 根据调度员提供的股票名称或代码，使用工具获取具体的股票名称和代码。
-        2. 使用工具获取该股票的所有数据。
-        注意：调用"fetch_data"工具后，所有数据已经保存，你需要检查数据是否正常（若指数数据获取失败是正常的），若正常则回复"数据已保存，数据无异常"。
+    你是一名拥有二十年从业经验的专业的股票研究员，接收到调度员的指示搜集信息。
+    你的任务是：根据用户输入推断出股票名称或代码，使用工具获取具体的股票名称和代码并获取用户指定时间段的该股票的市场数据。
 
+    注意：
+        1. 若用户输入多个股票和代码，则询问用户选择哪一个。
+        2. 若用户没有指定时间信息，则传入默认时间参数。
+        3. 调用"fetch_data"工具后，所有数据已经保存。
     """
-    messages = state["messages"]
-    # 检查第一条是否为system prompt，若不是则添加
-    if not messages or not isinstance(messages[0], SystemMessage):
-        messages = [SystemMessage(content=system_prompt)] + messages
+
+    messages = state.get("messages", [])
+    user_query = state.get("user_query", "")
+
+    # 如果 messages 为空，说明是首次调用，需要构造初始对话
+    if not messages:
+        human_message = f"用户输入：{user_query}"
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=human_message)
+        ]
+    else:
+        # 已有历史消息（如工具调用后的循环），确保系统提示在最前面
+        if not isinstance(messages[0], SystemMessage):
+            messages.insert(0, SystemMessage(content=system_prompt))
 
     response = llm_with_tools.invoke(messages)
     return {"messages": [response]}
@@ -146,7 +167,7 @@ def update_state_from_tool(state: ResearcherState) -> dict:
     当最后一条消息是 fetch_data 工具返回的 ToolMessage 时，
     将其内容解析为 JSON 并更新到全局状态的对应字段中。
     """
-    print("\n⚙️ 进入 update_state_from_tool 节点")  # 调试用
+    # print("\n⚙️ 进入 update_state_from_tool 节点")  # 调试用
     messages = state["messages"]
     if not messages:
         return {}
@@ -158,28 +179,36 @@ def update_state_from_tool(state: ResearcherState) -> dict:
     #     print(f"调用的工具名称: {last_msg.name}")
     # ############## 调试用 ##############
 
+    
     # 同名字段会自动更新到父节点
     if isinstance(last_msg, ToolMessage) and last_msg.name == "fetch_data":
+        fetch_times = state["fetch_times"] + 1
+        updates = {
+            "fetch_times": fetch_times,
+            "collected_data":{}
+        }
         try:
             data = json.loads(last_msg.content)
         except Exception:
             # 如果解析失败，保持原样
             return {}
-        updates = {"collected_data":{}}
+        
         # 根据 get_all_data 实际返回的字段名进行映射
         if "market_data" in data:
-            updates["collected_data"]["market_data"] = data["market_data"]
-        if "financial_reports" in data:
-            updates["collected_data"]["financial_reports"] = data["financial_reports"]
-        if "industry_avg" in data:
-            updates["collected_data"]["industry_avg"] = data["industry_avg"]
-        if "index_data" in data:
-            updates["collected_data"]["index_data"] = data["index_data"]
+            updates["collected_data"] = data
+        # if "financial_reports" in data:
+        #     updates["collected_data"]["financial_reports"] = data["financial_reports"]
+        # if "industry_avg" in data:
+        #     updates["collected_data"]["industry_avg"] = data["industry_avg"]
+        # if "index_data" in data:
+        #     updates["collected_data"]["index_data"] = data["index_data"]
         # if "stock_code" in data:
         #     updates["stock_code"] = data["stock_code"]
         # if "stock_name" in data:
         #     updates["stock_name"] = data["stock_name"]
         # print("-"*20,"\n",updates)
+        print("\n----已更新 Reseaercher 状态----")
+        updates["data_available"] = True
         return updates
     return {}
 
@@ -188,10 +217,22 @@ def should_continue(state: ResearcherState) -> Literal["tool_node", "__end__"]:
     messages = state["messages"]
     last_message = messages[-1]
     # 如果最后一条消息包含了工具调用，则路由到 "tool_node"
-    if last_message.tool_calls:
+    if last_message.tool_calls and state["fetch_times"] <= 3:
         return "tool_node"
     # 否则，流程结束
     return END
+
+# 判断下一个节点应该往哪里走
+def should_analysis_or_not(state: ResearcherState) -> Literal["__end__", "llm"]:
+    intent = state["intent"]
+    if intent == "price_check":
+        return "llm"
+    else:
+        if state["data_available"]:
+            print("\n已成功获取数据，进入分析环节......")
+            return END
+        else:
+            return "llm"
 
 def Researcher_Agent() -> CompiledStateGraph:
 
@@ -218,8 +259,14 @@ def Researcher_Agent() -> CompiledStateGraph:
         }
     )
     workflow.add_edge("tool_node", "update_node")
-    workflow.add_edge("update_node", "llm")
-
+    workflow.add_conditional_edges(
+        "update_node",
+        should_analysis_or_not,
+        {
+            "llm": "llm",
+            END: END
+        }
+    )
     Agent = workflow.compile()
     return Agent
 
@@ -228,7 +275,17 @@ if __name__ == "__main__":
 
     Agent = Researcher_Agent()
 
-    # ！！注意：输入全局状态中的stock_code，在上层应用中调用invoke
-    response = Agent.invoke({"messages": ["获取000012从20250401到20250601的所有信息"]})
+    query = "我想查询茅台的相关信息"
+    initial_state = {
+        "user_query": query,
+        "fetch_times": 0,
+        "intent": "unknown",
+        "stock_code": None,
+        "stock_name": None,
+        "collected_data": None,
+        "data_available": False
+        # "messages" 字段可以不传，让 call_llm 内部构建
+    }
+    response = Agent.invoke(initial_state)
     print_messages_simple(response["messages"])
 

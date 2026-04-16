@@ -192,22 +192,7 @@ def supervisor_node(state: InvestmentState) -> dict:
         # 保持中断状态，直接返回，外部条件边会路由到 END
         return {}
 
-    # 2. 必填槽位校验：股票代码
-    stock_code = state.get("stock_code")
-    if not stock_code or not validate_stock_code(stock_code):
-        # 尝试简单的正则提取作为 Hint，不强求格式完全正确
-        extracted_hint = extract_stock_code_hint(state["user_query"]) 
-        if extracted_hint:
-            return {"stock_code": extracted_hint}  # 输入用户信息，让 Researcher 去完善
-        else:
-            return {
-                "needs_clarification": True,
-                "clarification_question": "请提供您要查询的股票代码或名称（例如：sh600519 或 600519 或 茅台）",
-                "current_phase": "interrupted",
-                "last_worker": "supervisor"
-            }
-
-    # 3. 意图校验：若为 unknown，尝试重新识别
+    # 2. 意图校验：若为 unknown，尝试重新识别，失败则请求澄清
     if state.get("intent") == "unknown":
         new_intent = hybrid_recognize_intent(state["user_query"])
         if new_intent != "unknown":
@@ -220,17 +205,22 @@ def supervisor_node(state: InvestmentState) -> dict:
                 "last_worker": "supervisor"
             }
 
-    # 4. 根据意图设定后续执行路径（通过更新 current_phase 指示下一步）
+    # 3. 根据意图设定后续执行路径，股票代码的获取与校验交由 Researcher 处理
     intent = state["intent"]
-    if intent == "price_check":
-        next_phase = "researcher"        # 仅需查价，直接走 Researcher
-    elif intent in ("analyze_only", "full_advice"):
-        next_phase = "researcher"        # 需分析或建议，先从数据采集开始
+    if intent in ("price_check", "analyze_only", "full_advice"):
+        next_phase = "researcher"
     else:
-        next_phase = "supervisor"        # 异常回退
-
+        next_phase = "supervisor"  # 异常回退
     return {
         "current_phase": next_phase,
         "needs_clarification": False,
         "last_worker": "supervisor"
     }
+
+def route_entry(state: InvestmentState) -> str:
+    # 如果处于中断状态且 messages 中有新的用户输入，直接让 Researcher 处理
+    if state.get("needs_clarification"):
+        return "researcher"
+    return "supervisor"
+
+# builder.add_conditional_edges(START, route_entry)
