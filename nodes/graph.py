@@ -1,7 +1,17 @@
+"""
+父图文件，连接各子图
+"""
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 from typing import TypedDict, List, Dict, Any, Optional, Literal, Annotated
-from langgraph.graph.message import add_messages
+from langgraph.graph.message import add_messages ,StateGraph
 from langchain_core.messages import BaseMessage
-import re
+from nodes.Researcher import Researcher_Agent
+from nodes.Supervisor import supervisor_Graph
 
 class InvestmentState(TypedDict):
     # 全局状态
@@ -78,30 +88,14 @@ class InvestmentState(TypedDict):
     }
     """
 
-# ---------- 辅助校验函数 ----------
-def validate_stock_code(code: str) -> bool:
-    """校验股票代码格式：交易所后缀（SH/SZ/BJ）+ 6位数字，如 sh600010"""
-    pattern = r"^(sh|sz|bj)\d{6}$"
-    return bool(re.match(pattern, code))
+# # 创建父图、子图
+# def build_parent_graph():
+#     workflow = StateGraph(InvestmentState)
 
-def validate_collected_data(data: Dict) -> bool:
-    """检查 collected_data 是否包含最小必要字段"""
-    required_top_keys = {"stock_code", "market_data", "financial_reports", "news_data"}
-    if not required_top_keys.issubset(data.keys()):
-        return False
-    market = data["market_data"]
-    if "kline_daily" not in market or len(market["kline_daily"]) < 30:
-        return False
-    return True
+#     researcher_graph = build_researcher_graph()
+#     workflow.add_node("researcher", researcher_graph)
 
-# 创建父图、子图
-def build_parent_graph():
-    workflow = StateGraph(InvestmentState)
-
-    researcher_graph = build_researcher_graph()
-    workflow.add_node("researcher", researcher_graph)
-
-    # ...其他节点和边
-    return workflow.compile()
+#     # ...其他节点和边
+#     return workflow.compile()
 
     

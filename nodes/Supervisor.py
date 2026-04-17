@@ -8,13 +8,27 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import re
-from langgraph.graph import StateGraph, END
-from typing import Literal, Dict, Union, List
+from langgraph.graph import add_messages, StateGraph, END, START
+from langgraph.graph.state import CompiledStateGraph
+from typing import Literal, Dict, Union, List, Optional, TypedDict, Any, Annotated
+from langchain_core.messages import BaseMessage
 import requests
 from tqdm import tqdm
-from nodes.graph import InvestmentState
+import time
 import numpy as np
 import ollama
+
+class SupervisorState(TypedDict):
+    # ----- 全局状态----- 
+    user_query: str
+    intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
+    
+    # ----- Supervisor字段 -----
+    last_worker: Literal["Supervisor", "Researcher", "Analyst", "Advisor"]         # 记录最后执行的子图名称，用于断点恢复
+    next_worker: Optional[str]
+    # needs_clarification: bool          # 是否需要暂停并向用户追问
+    # clarification_question: str        # 向用户展示的追问内容
+    # current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
 
 def SentenceTransformer(texts: Union[str, List[str]], batch_size: int = 32) -> Union[List[float], List[List[float]]]:
     """
@@ -62,22 +76,22 @@ INTENT_EMBEDDINGS = {
 }
 
 # ---------- 辅助校验函数 ----------
-def validate_stock_code(code: str) -> bool:
-    """校验股票代码格式：交易所后缀（SH/SZ/BJ）+ 6位数字，如 sh600010"""
-    pattern = r"^(sh|sz|bj)\d{6}$"
-    return bool(re.match(pattern, code))
+# def validate_stock_code(code: str) -> bool:
+#     """校验股票代码格式：交易所后缀（SH/SZ/BJ）+ 6位数字，如 sh600010"""
+#     pattern = r"^(sh|sz|bj)\d{6}$"
+#     return bool(re.match(pattern, code))
 
-def validate_collected_data(data: Dict) -> bool:
-    """检查 collected_data 是否包含最小必要字段"""
-    required_top_keys = {"stock_code", "collected_data"}
-    if not required_top_keys.issubset(data.keys()):
-        return False
-    market = data["collected_data"]["market_data"]
-    if "kline_daily" not in market or len(market["kline_daily"]) < 15:
-        return False
-    return True
+# def validate_collected_data(data: Dict) -> bool:
+#     """检查 collected_data 是否包含最小必要字段"""
+#     required_top_keys = {"stock_code", "collected_data"}
+#     if not required_top_keys.issubset(data.keys()):
+#         return False
+#     market = data["collected_data"]["market_data"]
+#     if "kline_daily" not in market or len(market["kline_daily"]) < 15:
+#         return False
+#     return True
 
-# 从文本中简单提取股票代码（生产环境建议用更鲁棒的NER）
+# 从文本中简单提取股票代码
 def extract_stock_code(query: str) -> Optional[str]:
     import re
     # 匹配 6 位数字代码，并自动补全前缀（默认按上交所处理，实际需智能判断）
@@ -169,7 +183,7 @@ def llm_recognize_intent(query: str) -> Literal["price_check", "analyze_only", "
         print(f"[LLM意图识别错误] 调用 Ollama 失败: {e}")
         return "unknown"  # 发生异常时安全兜底
 
-# 混合搜索，在特定情况下减小响应时间
+# 混合识别，在特定情况下减小响应时间
 def hybrid_recognize_intent(query: str) -> str:
     # 规则
     rule_result = re_recognize_intent(query)
@@ -182,45 +196,100 @@ def hybrid_recognize_intent(query: str) -> str:
         # llm兜底
         return llm_recognize_intent(query)
 
-def supervisor_node(state: InvestmentState) -> dict:
+def get_intent_node(state: SupervisorState) -> dict:
+    print("\n进入get_intent_node... ...")
+    query = state.get("user_query", "")
+    if query != "":
+        intent = hybrid_recognize_intent(query)
+        print(f"\n提取到用户意图：{intent}")
+        return {"intent": intent}
+    print(f"\n!用户意图：unknown")
+    return {"intent": "unknown"}
+
+def schedule_node(state: SupervisorState) -> dict:
+    print("\n进入schedule_node... ...")
+    intent = state.get("intent")
+    last_worker = state.get("last_worker")
+    if intent and last_worker:
+        if last_worker == "Supervisor":
+            next_worker = "Researcher"
+        elif last_worker == "Researcher":
+            next_worker = "end" if intent == "price_check" else "Analyst"
+        elif last_worker == "Analyst":
+            next_worker = "end" if intent == "analyze_only" else "Advisor"
+        elif last_worker == "Advisor":
+            next_worker = "end"
+        # elif last_worker == "start":
+        #     next_worker = "Supervisor"
+        else:
+            print(f"\nSuperviorState中last_worker:{last_worker}出现错误！")
+            return {}
+        print(state)
+        return {
+            "next_worker": next_worker
+        }
+    return {}
+
+def start_condition(state: SupervisorState) -> str:
+    intent = state.get("intent", "")
+    if not intent or intent == "unknown":
+        return "get_intent"
+    return "schedule"
+
+def intent_condition(state: SupervisorState) -> str:
+    intent = state.get("intent", "")
+    # print(state)
+    if intent == "unknown":
+        return END
+    return "schedule"
+
+def Supervisor_Graph() -> CompiledStateGraph:
     """
-    监督者节点：负责全局状态校验、任务编排与中断决策。
+    监督者节点：负责任务编排。
     注意：该节点不直接执行任何业务计算，仅做决策和状态更新。
     """
-    # 1. 优先处理中断恢复场景：如果用户已提供补充信息，needs_clarification 应由上游设为 False
-    if state.get("needs_clarification"):
-        # 保持中断状态，直接返回，外部条件边会路由到 END
-        return {}
+    workflow = StateGraph(SupervisorState)
 
-    # 2. 意图校验：若为 unknown，尝试重新识别，失败则请求澄清
-    if state.get("intent") == "unknown":
-        new_intent = hybrid_recognize_intent(state["user_query"])
-        if new_intent != "unknown":
-            return {"intent": new_intent}
-        else:
-            return {
-                "needs_clarification": True,
-                "clarification_question": "您是想要查看实时报价，还是进行详细分析并获取投资建议？",
-                "current_phase": "interrupted",
-                "last_worker": "supervisor"
-            }
+    workflow.add_node("get_intent", get_intent_node)
+    workflow.add_node("schedule", schedule_node)
 
-    # 3. 根据意图设定后续执行路径，股票代码的获取与校验交由 Researcher 处理
-    intent = state["intent"]
-    if intent in ("price_check", "analyze_only", "full_advice"):
-        next_phase = "researcher"
-    else:
-        next_phase = "supervisor"  # 异常回退
-    return {
-        "current_phase": next_phase,
-        "needs_clarification": False,
-        "last_worker": "supervisor"
+    workflow.add_conditional_edges(
+        START,
+        start_condition
+    )
+    workflow.add_conditional_edges(
+        "get_intent",
+        intent_condition
+    )
+    workflow.add_edge("schedule", END)
+
+    Supervisor = workflow.compile()
+
+    return Supervisor
+
+# def route_entry(state: SupervisorState) -> str:
+#     # 如果处于中断状态且 messages 中有新的用户输入，直接让 Researcher 处理
+#     if state.get("needs_clarification"):
+#         return "researcher"
+#     return "supervisor"
+
+
+if __name__ == "__main__":
+    Supervisor = Supervisor_Graph()
+    initial_state = {
+        # ----- 全局状态----- 
+        "user_query": "对于茅台的股票由什么建议？",
+        "intent": "analyze_only",
+        
+        # ----- Supervisor字段 -----
+        "last_worker": "Researcher",
+        "next_worker": ""
     }
+    start_time = time.time()
 
-def route_entry(state: InvestmentState) -> str:
-    # 如果处于中断状态且 messages 中有新的用户输入，直接让 Researcher 处理
-    if state.get("needs_clarification"):
-        return "researcher"
-    return "supervisor"
-
+    result = Supervisor.invoke(initial_state)
+    end_time = time.time()
+    print(f"\n========== 执行完成 ==========")
+    print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
+    print(f"最终状态：{result}")
 # builder.add_conditional_edges(START, route_entry)

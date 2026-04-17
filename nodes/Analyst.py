@@ -1,5 +1,5 @@
 """
-Researcher节点：获取名称或代码对应的所有信息，获取的信息自动以json格式保存至全局InvestmentState之中
+Analyst节点：获取名称或代码对应的所有信息，获取的信息自动以json格式保存至全局InvestmentState之中
 """
 import sys
 from pathlib import Path
@@ -27,7 +27,6 @@ import os
 from typing import Literal
 from pydantic import BaseModel, Field
 
-from akshare_tools.Data_Fetch import get_all_data, query_by_name_keyword as _query_by_name_keyword, query_by_code as _query_by_code
 from nodes.graph import InvestmentState
 
 def print_messages_simple(messages):
@@ -56,10 +55,9 @@ def print_messages_simple(messages):
         else:
             print(f"agent回复内容: {msg.content}")
 
-class ResearcherState(TypedDict):
-    """Researcher Agent State"""
+class AnalystState(TypedDict):
+    """Analyst Agent State"""
     messages: Annotated[List[BaseMessage], add_messages]
-    fetch_times: int
 
     # 同步全局 InvestmentState
     user_query: str
@@ -75,31 +73,31 @@ class GetStockAllDataInput(BaseModel):
     start_date: str = Field(description="开始日期，格式 YYYYMMDD（默认20250601）")
     end_date: str = Field(description="结束日期，格式 YYYYMMDD（默认20260101）")
 
-@tool(args_schema=GetStockAllDataInput)
-def fetch_data(symbol: str, start_date="20250601", end_date="20260101")->dict:
-    """获取指定股票代码在指定日期范围内的数据，包括行情、财务等综合信息，输出JSON格式。"""
-    result = get_all_data(symbol, start_date, end_date)
-    if result == None:
-        print("\nfetch_data工具调用结果为空")
-    return result
+# @tool(args_schema=GetStockAllDataInput)
+# def fetch_data(symbol: str, start_date="20250601", end_date="20260101")->dict:
+#     """获取指定股票代码在指定日期范围内的数据，包括行情、财务等综合信息，输出JSON格式。"""
+#     result = get_all_data(symbol, start_date, end_date)
+#     if result == None:
+#         print("\nfetch_data工具调用结果为空")
+#     return result
 
-@tool
-def get_by_stock_keyword(keyword:str) -> list[str]:
-    """根据股票名称查找股票代码"""
-    row = _query_by_name_keyword(keyword=keyword)
-    if len(row) == 1:
-        return {"stock_code":row[0][0],"stock_name":row[0][1]}
-    else:
-        return row
+# @tool
+# def get_by_stock_keyword(keyword:str) -> list[str]:
+#     """根据股票名称查找股票代码"""
+#     row = _query_by_name_keyword(keyword=keyword)
+#     if len(row) == 1:
+#         return {"stock_code":row[0][0],"stock_name":row[0][1]}
+#     else:
+#         return row
 
-@tool
-def get_by_stock_code(code:str) -> list[str]:
-    """根据股票代码查找股票名称"""
-    row = _query_by_code(code=code)
-    if len(row) == 1:
-        return {"stock_code":row[0][0],"stock_name":row[0][1]}
-    else:
-        return row
+# @tool
+# def get_by_stock_code(code:str) -> list[str]:
+#     """根据股票代码查找股票名称"""
+#     row = _query_by_code(code=code)
+#     if len(row) == 1:
+#         return {"stock_code":row[0][0],"stock_name":row[0][1]}
+#     else:
+#         return row
 
 @wrap_tool_call
 def handle_tool_errors(request, handler):
@@ -128,27 +126,35 @@ def create_llm(temperature: float, max_tokens: int) -> AzureChatOpenAI:
         # print("✅ Azure OpenAI 模型初始化成功！")
         return llm
 
-def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
-    if llm_with_tools is None:
-        raise ValueError("llm_with_tools must be provided to call_llm.")
+def call_llm_analysis(state: AnalystState, llm=None) -> dict:
+    if llm is None:
+        raise ValueError("llm must be provided to call_llm_analysis.")
     
     # 注意！！需要重新写prompt
     system_prompt="""
-    你是一名拥有二十年从业经验的专业的股票研究员，接收到调度员的指示搜集信息。
-    你的任务是：根据用户输入推断出股票名称或代码，使用工具获取具体的股票名称和代码并获取用户指定时间段的该股票的市场数据。
+    你是一名拥有二十年从业经验的专业的股票分析员。
+    你的任务是：根据获取到的股票数据以及各项指标对股票（或企业）的发展前景、风险等等信息进行分析。
 
     注意：
-        1. 若用户输入多个股票和代码，则询问用户选择哪一个。
-        2. 若用户没有指定时间信息，则传入默认时间参数。
-        3. 调用"fetch_data"工具后，所有数据已经保存。
+        1. 一定要以中立、客观的角度分析，不得带有个人主观看法。
     """
 
     messages = state.get("messages", [])
     user_query = state.get("user_query", "")
+    stock_name = state.get("stock_name", "")
+    stock_code = state.get("stock_code", "")
+    collected_data = state.get("collected_data", "")
 
     # 如果 messages 为空，说明是首次调用，需要构造初始对话
     if not messages:
-        human_message = f"用户输入：{user_query}"
+        human_message = f"""
+            用户输入：{user_query}
+            当前已获得信息如下：
+                股票名称：{stock_name}
+                股票代码：{stock_code}
+                股票数据：{collected_data}
+            请对该股票进行分析。
+        """
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_message)
@@ -158,10 +164,10 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
         if not isinstance(messages[0], SystemMessage):
             messages.insert(0, SystemMessage(content=system_prompt))
 
-    response = llm_with_tools.invoke(messages)
+    response = llm.invoke(messages)
     return {"messages": [response]}
 
-def update_state_from_tool(state: ResearcherState) -> dict:
+def update_state_from_tool(state: AnalystState) -> dict:
     """
     当最后一条消息是 fetch_data 工具返回的 ToolMessage 时，
     将其内容解析为 JSON 并更新到全局状态的对应字段中。
@@ -211,7 +217,7 @@ def update_state_from_tool(state: ResearcherState) -> dict:
         return updates
     return {}
 
-def should_continue(state: ResearcherState) -> Literal["tool_node", "__end__"]:
+def should_continue(state: AnalystState) -> Literal["tool_node", "__end__"]:
     """检查最后一条消息，决定下一步去向。"""
     messages = state["messages"]
     last_message = messages[-1]
@@ -222,7 +228,7 @@ def should_continue(state: ResearcherState) -> Literal["tool_node", "__end__"]:
     return END
 
 # 判断下一个节点应该往哪里走
-def should_analysis_or_not(state: ResearcherState) -> Literal["__end__", "llm"]:
+def should_analysis_or_not(state: AnalystState) -> Literal["__end__", "llm"]:
     intent = state["intent"]
     if intent == "price_check":
         return "llm"
@@ -233,46 +239,42 @@ def should_analysis_or_not(state: ResearcherState) -> Literal["__end__", "llm"]:
         else:
             return "llm"
 
-def Researcher_Agent() -> CompiledStateGraph:
+def Analyst_Agent() -> CompiledStateGraph:
 
     llm = create_llm(temperature=0.2, max_tokens=1024)
-    tools = [fetch_data, get_by_stock_keyword, get_by_stock_code]
-    llm_with_tools = llm.bind_tools(tools)
 
-    tool_node = ToolNode(tools, awrap_tool_call=handle_tool_errors)
-
-    workflow = StateGraph(ResearcherState)
+    workflow = StateGraph(AnalystState)
     # Use a lambda to pass llm_with_tools to call_llm
-    workflow.add_node("llm", lambda state: call_llm_with_tools(state, llm_with_tools))
-    workflow.add_node("tool_node", tool_node)
+    workflow.add_node("llm", lambda state: call_llm_analysis(state, llm))
+    # workflow.add_node("tool_node", tool_node)
     workflow.add_node("update_node", update_state_from_tool)
 
     workflow.add_edge(START, "llm")
     # workflow.add_edge("tool_node","llm")
-    workflow.add_conditional_edges(
-        "llm",
-        should_continue,
-        {
-            "tool_node": "tool_node",
-            END: END
-        }
-    )
-    workflow.add_edge("tool_node", "update_node")
-    workflow.add_conditional_edges(
-        "update_node",
-        should_analysis_or_not,
-        {
-            "llm": "llm",
-            END: END
-        }
-    )
+    # workflow.add_conditional_edges(
+    #     "llm",
+    #     should_continue,
+    #     {
+    #         "tool_node": "tool_node",
+    #         END: END
+    #     }
+    # )
+    # workflow.add_edge("tool_node", "update_node")
+    # workflow.add_conditional_edges(
+    #     "update_node",
+    #     should_analysis_or_not,
+    #     {
+    #         "llm": "llm",
+    #         END: END
+    #     }
+    # )
     Agent = workflow.compile()
     return Agent
 
 
 if __name__ == "__main__":
 
-    Agent = Researcher_Agent()
+    Agent = Analyst_Agent()
 
     query = "我想查询茅台的相关信息"
     initial_state = {
