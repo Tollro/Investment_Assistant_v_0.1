@@ -18,17 +18,26 @@ import time
 import numpy as np
 import ollama
 
+
+WorkerType = Literal["Supervisor", "Researcher", "Analyst", "Advisor"]
+
 class SupervisorState(TypedDict):
     # ----- 全局状态----- 
     user_query: str
     intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
     
     # ----- Supervisor字段 -----
-    last_worker: Literal["Supervisor", "Researcher", "Analyst", "Advisor"]         # 记录最后执行的子图名称，用于断点恢复
-    next_worker: Optional[str]
+    last_worker: Optional[WorkerType]          # 记录最后执行的子图
+    next_worker: Optional[Union[WorkerType, Literal["end"]]]  # 下一步去向
     # needs_clarification: bool          # 是否需要暂停并向用户追问
     # clarification_question: str        # 向用户展示的追问内容
     # current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
+
+    # 可扩展字段
+    stock_code: Optional[str]
+    stock_name: Optional[str]
+    data_available: bool
+
 
 def SentenceTransformer(texts: Union[str, List[str]], batch_size: int = 32) -> Union[List[float], List[List[float]]]:
     """
@@ -68,28 +77,14 @@ def SentenceTransformer(texts: Union[str, List[str]], batch_size: int = 32) -> U
     # 单句输入时返回单个向量，不再嵌套列表
     return all_embeddings[0] if single_input else all_embeddings
 
+
 # ----------- 引入语义向量模型 -----------
 INTENT_EMBEDDINGS = {
-    "price_check": SentenceTransformer("查询股票实时价格、报价、涨跌幅"),
-    "analyze_only": SentenceTransformer("分析股票走势、技术指标、K线形态，不需要投资建议"),
-    "full_advice": SentenceTransformer("给出股票买入卖出建议、投资评级、持有还是抛售"),
+    "price_check": SentenceTransformer("查询股票实时价格或报价或涨跌幅"),
+    "analyze_only": SentenceTransformer("分析股票走势或技术指标或K线形态，不需要投资建议"),
+    "full_advice": SentenceTransformer("给出股票买入卖出建议或投资评级或持有还是抛售"),
 }
 
-# ---------- 辅助校验函数 ----------
-# def validate_stock_code(code: str) -> bool:
-#     """校验股票代码格式：交易所后缀（SH/SZ/BJ）+ 6位数字，如 sh600010"""
-#     pattern = r"^(sh|sz|bj)\d{6}$"
-#     return bool(re.match(pattern, code))
-
-# def validate_collected_data(data: Dict) -> bool:
-#     """检查 collected_data 是否包含最小必要字段"""
-#     required_top_keys = {"stock_code", "collected_data"}
-#     if not required_top_keys.issubset(data.keys()):
-#         return False
-#     market = data["collected_data"]["market_data"]
-#     if "kline_daily" not in market or len(market["kline_daily"]) < 15:
-#         return False
-#     return True
 
 # 从文本中简单提取股票代码
 def extract_stock_code(query: str) -> Optional[str]:
@@ -108,19 +103,23 @@ def extract_stock_code(query: str) -> Optional[str]:
             return f"sh{code}"  # 默认赋予上交所前缀
     return None
 
-def re_recognize_intent(query: str) -> Literal["price_check", "analyze_only", "full_advice", "unknown"]:
+
+def rule_based_intent(query: str) -> Literal["price_check", "analyze_only", "full_advice", "unknown"]:
+    """基于规则的意图识别，快速响应常见关键词。"""
     query_lower = query.lower()
-    if any(kw in query_lower for kw in ["价格", "报价", "多少钱", "实时"]):
+    # 价格查询关键词
+    if any(kw in query_lower for kw in ["价格", "报价", "多少钱", "实时", "现价", "涨跌幅", "涨了", "跌了"]):
         return "price_check"
-    if any(kw in query_lower for kw in ["分析", "走势", "技术面"]):
+    # 分析关键词（不含建议）
+    if any(kw in query_lower for kw in ["分析", "走势", "技术面", "k线", "指标", "形态", "趋势"]):
         return "analyze_only"
-    if any(kw in query_lower for kw in ["建议", "推荐", "买入", "卖出"]):
+    # 建议关键词
+    if any(kw in query_lower for kw in ["建议", "推荐", "买入", "卖出", "持有", "抛售", "操作", "策略"]):
         return "full_advice"
-    if "不" in query or "别" in query:
-        return "unknown"
     return "unknown"
 
-def vec_recognize_intent(query: str) -> Literal["price_check", "analyze_only", "full_advice", "unknown"]:
+
+def vector_based_intent(query: str, threshold=0.5 ) -> Literal["price_check", "analyze_only", "full_advice", "unknown"]:
     query_vec = SentenceTransformer(query)
     max_score = -1
     best_intent = "unknown"
@@ -132,9 +131,25 @@ def vec_recognize_intent(query: str) -> Literal["price_check", "analyze_only", "
             best_intent = intent
             
     # 设定阈值，低于阈值依然归为 unknown 触发中断
-    return best_intent if max_score > 0.5 else "unknown"
+    return best_intent if max_score > threshold else "unknown"
 
-def llm_recognize_intent(query: str) -> Literal["price_check", "analyze_only", "full_advice", "unknown"]:
+
+def clean_llm_output(raw: str) -> str:
+    """
+    清洗 LLM 输出，移除 DeepSeek-R1 的  标签及其他干扰内容。
+    """
+    # 移除  ...  标签及其内容
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    # 移除可能残留的 XML 标签
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    # 提取第一个出现的有效意图标签
+    for label in ["price_check", "analyze_only", "full_advice", "unknown"]:
+        if label in cleaned.lower():
+            return label
+    return "unknown"
+
+
+def llm_based_intent(query: str) -> Literal["price_check", "analyze_only", "full_advice", "unknown"]:
     """
     使用 Ollama 本地模型进行意图识别兜底。
     强制模型仅返回四个预定义标签之一。
@@ -155,46 +170,40 @@ def llm_recognize_intent(query: str) -> Literal["price_check", "analyze_only", "
 
     【意图标签】
     """
-    
     try:
+        print("\n使用llm获取用户intent......")
         response = ollama.chat(
             model="deepseek-r1:1.5b",
             messages=[{"role": "user", "content": prompt}],
             options={
                 "temperature": 0.0,        # 消除随机性，保证输出稳定
-                "num_predict": 20,          # 最大生成 token 数，防止废话
+                # "num_predict": 50,          # 最大生成 token 数，防止废话
                 "top_p": 0.1               # 极低核采样，增强确定性
             }
         )
-        
         # 提取并清洗模型返回内容
         raw_output = response["message"]["content"].strip().lower()
-        
-        # 例如模型可能返回 "price_check。" 或 "intent: price_check"
-        for label in ["price_check", "analyze_only", "full_advice", "unknown"]:
-            if label in raw_output:
-                return label
-        
-        # 如果没匹配到任何标签，记录日志并返回 unknown
-        print(f"[LLM意图识别异常] 模型返回非预期内容: {raw_output}")
-        return "unknown"
-        
+        print(f"[LLM原始输出] {raw_output[:100]}...")  # 调试用
+        cleaned = clean_llm_output(raw_output)
+        print(f"[LLM清洗后] {cleaned}")
+        return cleaned
     except Exception as e:
-        print(f"[LLM意图识别错误] 调用 Ollama 失败: {e}")
-        return "unknown"  # 发生异常时安全兜底
+        print(f"[LLM意图识别错误] {e}")
+        return "unknown"
 
 # 混合识别，在特定情况下减小响应时间
 def hybrid_recognize_intent(query: str) -> str:
     # 规则
-    rule_result = re_recognize_intent(query)
+    rule_result = rule_based_intent(query)
     # 向量
-    vec_result = vec_recognize_intent(query)
+    vec_result = vector_based_intent(query, threshold=0.5)
 
     if rule_result == vec_result and rule_result != "unknown":
         return vec_result
     else:
         # llm兜底
-        return llm_recognize_intent(query)
+        return llm_based_intent(query)
+
 
 def get_intent_node(state: SupervisorState) -> dict:
     print("\n进入get_intent_node... ...")
@@ -206,42 +215,62 @@ def get_intent_node(state: SupervisorState) -> dict:
     print(f"\n!用户意图：unknown")
     return {"intent": "unknown"}
 
+
 def schedule_node(state: SupervisorState) -> dict:
     print("\n进入schedule_node... ...")
-    intent = state.get("intent")
-    last_worker = state.get("last_worker")
-    if intent and last_worker:
-        if last_worker == "Supervisor":
-            next_worker = "Researcher"
-        elif last_worker == "Researcher":
-            next_worker = "end" if intent == "price_check" else "Analyst"
-        elif last_worker == "Analyst":
-            next_worker = "end" if intent == "analyze_only" else "Advisor"
-        elif last_worker == "Advisor":
-            next_worker = "end"
-        # elif last_worker == "start":
-        #     next_worker = "Supervisor"
-        else:
-            print(f"\nSuperviorState中last_worker:{last_worker}出现错误！")
-            return {}
-        print(state)
-        return {
-            "next_worker": next_worker
-        }
-    return {}
+    intent = state.get("intent", "unknown")
+    last = state.get("last_worker")
+    data_available = state.get("data_available", False)
 
+    # 初始进入：last 可能为 None，表示刚从 Supervisor 开始
+    if last is None:
+        next_worker = "Researcher"
+        print(f"[Supervisor] 初始调度 -> Researcher")
+        return {"next_worker": next_worker, "last_worker": "Supervisor"}
+
+    # 调度表：基于 (intent, last_worker) 映射到下一个 worker 或结束
+    # 格式: (intent, last) -> next
+    schedule_map = {
+        ("price_check", "Researcher"): "end",
+        ("analyze_only", "Researcher"): "Analyst" if data_available else "end",
+        ("full_advice", "Researcher"): "Analyst" if data_available else "end",
+        ("analyze_only", "Analyst"): "end",
+        ("full_advice", "Analyst"): "Advisor",
+        ("full_advice", "Advisor"): "end",
+    }
+
+    # 特殊：若意图 unknown，则直接结束
+    if intent == "unknown":
+        print("[Supervisor] 意图未知，流程结束")
+        return {"next_worker": "end"}
+
+    key = (intent, last)
+    next_worker = schedule_map.get(key)
+    if next_worker is None:
+        # 默认结束
+        print(f"[Supervisor] 未找到调度规则 (intent={intent}, last={last})，默认结束")
+        next_worker = "end"
+
+    print(f"[Supervisor] 调度: last={last}, intent={intent} -> next={next_worker}")
+    return {"next_worker": next_worker}
+
+
+# ================= 条件路由 =================
 def start_condition(state: SupervisorState) -> str:
-    intent = state.get("intent", "")
-    if not intent or intent == "unknown":
-        return "get_intent"
-    return "schedule"
+    """START 分支：若已有意图且不为 unknown，直接进入调度；否则先识别意图。"""
+    intent = state.get("intent")
+    if intent and intent != "unknown":
+        return "schedule"
+    return "get_intent"
+
 
 def intent_condition(state: SupervisorState) -> str:
-    intent = state.get("intent", "")
-    # print(state)
+    """识别意图后：若仍为 unknown，结束流程；否则进入调度。"""
+    intent = state.get("intent", "unknown")
     if intent == "unknown":
         return END
     return "schedule"
+
 
 def Supervisor_Graph() -> CompiledStateGraph:
     """
@@ -263,33 +292,31 @@ def Supervisor_Graph() -> CompiledStateGraph:
     )
     workflow.add_edge("schedule", END)
 
-    Supervisor = workflow.compile()
-
-    return Supervisor
-
-# def route_entry(state: SupervisorState) -> str:
-#     # 如果处于中断状态且 messages 中有新的用户输入，直接让 Researcher 处理
-#     if state.get("needs_clarification"):
-#         return "researcher"
-#     return "supervisor"
+    return workflow.compile()
 
 
 if __name__ == "__main__":
     Supervisor = Supervisor_Graph()
-    initial_state = {
-        # ----- 全局状态----- 
-        "user_query": "对于茅台的股票由什么建议？",
-        "intent": "analyze_only",
-        
-        # ----- Supervisor字段 -----
-        "last_worker": "Researcher",
-        "next_worker": ""
-    }
-    start_time = time.time()
-
-    result = Supervisor.invoke(initial_state)
-    end_time = time.time()
-    print(f"\n========== 执行完成 ==========")
-    print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
-    print(f"最终状态：{result}")
+    test_queries = [
+        "茅台现在多少钱？",
+        "帮我分析一下茅台的走势",
+        "茅台可以买入吗？"
+    ]
+    for q in test_queries:
+        print(f"\n{'='*40}\n用户输入: {q}")
+        initial_state = {
+            "user_query": q,
+            "intent": "",           # 初始为空，触发意图识别
+            "last_worker": None,
+            "next_worker": "",
+            "data_available": False
+        }
+        start_time = time.time()
+        result = Supervisor.invoke(initial_state)
+        end_time = time.time()
+        print(f"识别意图: {result.get('intent')}")
+        print(f"下一步: {result.get('next_worker')}")
+        print(f"\n========== 执行完成 ==========")
+        print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
+        print(f"最终状态：{result}")
 # builder.add_conditional_edges(START, route_entry)

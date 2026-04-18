@@ -1,5 +1,5 @@
 """
-Analyst节点：获取名称或代码对应的所有信息，获取的信息自动以json格式保存至全局InvestmentState之中
+Analyst节点：客观分析股票信息（基本面、技术面、消息面、风险）
 """
 import sys
 from pathlib import Path
@@ -12,29 +12,17 @@ from typing import TypedDict, List, Dict, Any, Optional, Literal, Annotated
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage
-from langgraph.prebuilt import ToolNode
-from typing import TypedDict, Annotated, Optional
-from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
-from langchain.tools import tool
-from langchain.agents.middleware import wrap_tool_call
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 from langchain_openai import AzureChatOpenAI
-from langchain_core.prompts import PromptTemplate
 import os
+import time
 
-from typing import Literal
-from pydantic import BaseModel, Field
-
-from nodes.graph import InvestmentState
 
 def print_messages_simple(messages):
-    """简洁打印消息列表，只显示类型、内容和工具调用信息"""
+    """简洁打印消息列表"""
     for i, msg in enumerate(messages):
         msg_type = msg.__class__.__name__
         print(f"\n--- 第 {i+1} 条消息 ({msg_type}) ---")
-        
         if msg_type == "HumanMessage":
             print(f"内容: {msg.content}")
         elif msg_type == "AIMessage":
@@ -45,15 +33,13 @@ def print_messages_simple(messages):
                     print(f"调用工具: {tc['name']}, 参数: {tc['args']}")
         elif msg_type == "ToolMessage":
             print(f"工具名称: {msg.name}")
-
-            # 如果返回内容过长可截断显示
             content = msg.content
             if len(content) > 200:
                 content = content[:200] + "..."
-                
             print(f"返回内容: {content}")
         else:
             print(f"agent回复内容: {msg.content}")
+
 
 class AnalystState(TypedDict):
     """Analyst Agent State"""
@@ -66,226 +52,146 @@ class AnalystState(TypedDict):
     stock_code: Optional[str]
     stock_name: Optional[str]
     collected_data: Optional[Dict[str, Any]]
-    data_available: bool
+    analysis: str
 
-class GetStockAllDataInput(BaseModel):
-    symbol: str = Field(description="股票代码（必须包含前缀），如 'sz000001'")
-    start_date: str = Field(description="开始日期，格式 YYYYMMDD（默认20250601）")
-    end_date: str = Field(description="结束日期，格式 YYYYMMDD（默认20260101）")
 
-# @tool(args_schema=GetStockAllDataInput)
-# def fetch_data(symbol: str, start_date="20250601", end_date="20260101")->dict:
-#     """获取指定股票代码在指定日期范围内的数据，包括行情、财务等综合信息，输出JSON格式。"""
-#     result = get_all_data(symbol, start_date, end_date)
-#     if result == None:
-#         print("\nfetch_data工具调用结果为空")
-#     return result
-
-# @tool
-# def get_by_stock_keyword(keyword:str) -> list[str]:
-#     """根据股票名称查找股票代码"""
-#     row = _query_by_name_keyword(keyword=keyword)
-#     if len(row) == 1:
-#         return {"stock_code":row[0][0],"stock_name":row[0][1]}
-#     else:
-#         return row
-
-# @tool
-# def get_by_stock_code(code:str) -> list[str]:
-#     """根据股票代码查找股票名称"""
-#     row = _query_by_code(code=code)
-#     if len(row) == 1:
-#         return {"stock_code":row[0][0],"stock_name":row[0][1]}
-#     else:
-#         return row
-
-@wrap_tool_call
-def handle_tool_errors(request, handler):
-    """使用自定义消息处理工具执行错误。"""
-    try:
-        return handler(request)
-    except Exception as e:
-        # 向模型返回自定义错误消息
-        return ToolMessage(
-            content=f"工具错误：请检查您的输入并重试。({str(e)})",
-            tool_call_id=request.tool_call["id"]
-        )
-
-def create_llm(temperature: float, max_tokens: int) -> AzureChatOpenAI:
+def create_llm(temperature: float) -> AzureChatOpenAI:
     llm = AzureChatOpenAI(
-                azure_endpoint=os.getenv("AZURE_GPT4O_ENDPOINT"),
-                api_key=os.getenv("AZURE_GPT4O_API_KEY"),
-                api_version="2025-01-01-preview",
-                model="gpt-4o",
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
+        azure_endpoint=os.getenv("AZURE_GPT4O_ENDPOINT"),
+        api_key=os.getenv("AZURE_GPT4O_API_KEY"),
+        api_version="2025-01-01-preview",
+        model="gpt-4o",
+        temperature=temperature
+    )
     if not llm:
         raise ValueError("Azure OpenAI 模型初始化失败，请检查环境变量设置。")
-    else:
-        # print("✅ Azure OpenAI 模型初始化成功！")
-        return llm
+    return llm
+
 
 def call_llm_analysis(state: AnalystState, llm=None) -> dict:
+    """
+    调用 LLM 生成客观分析，存入 messages。
+    若 analysis 字段已有内容且无需覆盖，可在此判断跳过（可选）。
+    """
     if llm is None:
         raise ValueError("llm must be provided to call_llm_analysis.")
-    
-    # 注意！！需要重新写prompt
-    system_prompt="""
-    你是一名拥有二十年从业经验的专业的股票分析员。
-    你的任务是：根据获取到的股票数据以及各项指标对股票（或企业）的发展前景、风险等等信息进行分析。
 
-    注意：
-        1. 一定要以中立、客观的角度分析，不得带有个人主观看法。
-    """
+    # 如果 analysis 已有内容且希望跳过生成，可取消下面注释
+    # if state.get("analysis"):
+    #     return {}
+
+    system_prompt = """
+你是一名拥有二十年从业经验的资深股票分析师，风格客观严谨。
+你的任务：基于提供的股票数据，对该股票进行全面、中立的分析，**仅分析事实，不提供任何投资建议**。
+
+分析必须包含以下四个方面（若某方面数据缺失，请注明“数据暂缺”）：
+1. **基本面分析**：盈利能力（ROE、毛利率）、成长性（营收/利润增速）、估值水平（PE/PB历史分位）、现金流与负债结构。
+2. **技术面分析**：近期价格走势、关键均线位置、成交量变化、技术指标信号（如MACD、RSI等）。
+3. **消息与事件面**：近期公告、行业政策、机构评级、新闻舆情倾向。
+4. **风险提示**：经营风险、行业竞争、宏观政策影响等潜在负面因素。
+
+要求：
+- 每个观点必须基于给出的客观数据，不得主观臆断。
+- 语言平实清晰，避免模糊表述。
+- 使用中文输出，分段描述，不要使用Markdown表格或代码块。
+- 仅分析，不提出“买入/卖出/持有”等建议。
+"""
 
     messages = state.get("messages", [])
     user_query = state.get("user_query", "")
     stock_name = state.get("stock_name", "")
     stock_code = state.get("stock_code", "")
-    collected_data = state.get("collected_data", "")
+    collected_data = state.get("collected_data", {})
 
-    # 如果 messages 为空，说明是首次调用，需要构造初始对话
     if not messages:
+        # 格式化数据
+        data_str = json.dumps(collected_data, ensure_ascii=False, indent=2) if collected_data else "无数据"
         human_message = f"""
-            用户输入：{user_query}
-            当前已获得信息如下：
-                股票名称：{stock_name}
-                股票代码：{stock_code}
-                股票数据：{collected_data}
-            请对该股票进行分析。
-        """
+用户提问：{user_query}
+股票名称：{stock_name}
+股票代码：{stock_code}
+已采集数据如下：
+{data_str}
+
+请根据以上信息，按要求的四个方面进行客观分析。
+"""
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_message)
         ]
     else:
-        # 已有历史消息（如工具调用后的循环），确保系统提示在最前面
         if not isinstance(messages[0], SystemMessage):
             messages.insert(0, SystemMessage(content=system_prompt))
 
     response = llm.invoke(messages)
     return {"messages": [response]}
 
-def update_state_from_tool(state: AnalystState) -> dict:
+
+def update_analysis(state: AnalystState) -> dict:
     """
-    当最后一条消息是 fetch_data 工具返回的 ToolMessage 时，
-    将其内容解析为 JSON 并更新到全局状态的对应字段中。
+    从最后一条 AIMessage 中提取文本内容，更新 analysis 字段。
     """
-    # print("\n⚙️ 进入 update_state_from_tool 节点")  # 调试用
-    messages = state["messages"]
+    messages = state.get("messages", [])
     if not messages:
-        return {}
+        return {"analysis": ""}
+
     last_msg = messages[-1]
-
-    # ############## 调试用 ##############
-    # print(f"最后一条消息类型: {type(last_msg).__name__}")
-    # if isinstance(last_msg, ToolMessage):
-    #     print(f"调用的工具名称: {last_msg.name}")
-    # ############## 调试用 ##############
-
-    
-    # 同名字段会自动更新到父节点
-    if isinstance(last_msg, ToolMessage) and last_msg.name == "fetch_data":
-        fetch_times = state["fetch_times"] + 1
-        updates = {
-            "fetch_times": fetch_times,
-            "collected_data":{}
-        }
-        try:
-            data = json.loads(last_msg.content)
-        except Exception:
-            # 如果解析失败，保持原样
-            return {}
-        
-        # 根据 get_all_data 实际返回的字段名进行映射
-        if "market_data" in data:
-            updates["collected_data"] = data
-        # if "financial_reports" in data:
-        #     updates["collected_data"]["financial_reports"] = data["financial_reports"]
-        # if "industry_avg" in data:
-        #     updates["collected_data"]["industry_avg"] = data["industry_avg"]
-        # if "index_data" in data:
-        #     updates["collected_data"]["index_data"] = data["index_data"]
-        # if "stock_code" in data:
-        #     updates["stock_code"] = data["stock_code"]
-        # if "stock_name" in data:
-        #     updates["stock_name"] = data["stock_name"]
-        # print("-"*20,"\n",updates)
-        print("\n----已更新 Reseaercher 状态----")
-        updates["data_available"] = True
-        return updates
+    if isinstance(last_msg, AIMessage) and last_msg.content:
+        return {"analysis": last_msg.content.strip()}
     return {}
 
-def should_continue(state: AnalystState) -> Literal["tool_node", "__end__"]:
-    """检查最后一条消息，决定下一步去向。"""
-    messages = state["messages"]
-    last_message = messages[-1]
-    # 如果最后一条消息包含了工具调用，则路由到 "tool_node"
-    if last_message.tool_calls and state["fetch_times"] <= 3:
-        return "tool_node"
-    # 否则，流程结束
-    return END
 
-# 判断下一个节点应该往哪里走
-def should_analysis_or_not(state: AnalystState) -> Literal["__end__", "llm"]:
-    intent = state["intent"]
-    if intent == "price_check":
-        return "llm"
-    else:
-        if state["data_available"]:
-            print("\n已成功获取数据，进入分析环节......")
-            return END
-        else:
-            return "llm"
-
-def Analyst_Agent() -> CompiledStateGraph:
-
-    llm = create_llm(temperature=0.2, max_tokens=1024)
+def Analyst_Graph() -> CompiledStateGraph:
+    llm = create_llm(temperature=0.2)
 
     workflow = StateGraph(AnalystState)
-    # Use a lambda to pass llm_with_tools to call_llm
+
     workflow.add_node("llm", lambda state: call_llm_analysis(state, llm))
-    # workflow.add_node("tool_node", tool_node)
-    workflow.add_node("update_node", update_state_from_tool)
+    workflow.add_node("update_analysis", update_analysis)
 
     workflow.add_edge(START, "llm")
-    # workflow.add_edge("tool_node","llm")
-    # workflow.add_conditional_edges(
-    #     "llm",
-    #     should_continue,
-    #     {
-    #         "tool_node": "tool_node",
-    #         END: END
-    #     }
-    # )
-    # workflow.add_edge("tool_node", "update_node")
-    # workflow.add_conditional_edges(
-    #     "update_node",
-    #     should_analysis_or_not,
-    #     {
-    #         "llm": "llm",
-    #         END: END
-    #     }
-    # )
-    Agent = workflow.compile()
-    return Agent
+    workflow.add_edge("llm", "update_analysis")
+    workflow.add_edge("update_analysis", END)
+
+    return workflow.compile()
 
 
 if __name__ == "__main__":
 
-    Agent = Analyst_Agent()
+    # 模拟已采集数据
+    mock_collected_data = {
+        "price": 1680.00,
+        "pe": 28.5,
+        "pb": 6.2,
+        "roe": 24.3,
+        "revenue_growth": 15.2,
+        "profit_growth": 12.1,
+        "debt_ratio": 0.22,
+        "rsi_14": 58.3,
+        "ma_50": 1650.0,
+        "ma_200": 1520.0,
+        "news_sentiment": "中性偏积极，近期多家机构维持买入评级，飞天茅台批价稳定。"
+    }
+
+    graph = Analyst_Graph()
 
     query = "我想查询茅台的相关信息"
     initial_state = {
         "user_query": query,
-        "fetch_times": 0,
         "intent": "unknown",
-        "stock_code": None,
-        "stock_name": None,
-        "collected_data": None,
-        "data_available": False
-        # "messages" 字段可以不传，让 call_llm 内部构建
+        "stock_code": "600519",
+        "stock_name": "贵州茅台",
+        "collected_data": mock_collected_data,
+        "analysis": ""                  # 初始为空，将由节点填充
     }
-    response = Agent.invoke(initial_state)
-    print_messages_simple(response["messages"])
+
+    start_time = time.time()
+    result = graph.invoke(initial_state)
+    end_time = time.time()
+    print(f"\n========== 执行完成 ==========")
+    print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
+
+    print("\n=== 最终分析内容 (analysis字段) ===")
+    print(result["analysis"])
+    print("\n=== 消息记录 ===")
+    print_messages_simple(result["messages"])
