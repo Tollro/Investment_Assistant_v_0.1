@@ -8,10 +8,30 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from typing import TypedDict, List, Dict, Any, Optional, Literal, Annotated
-from langgraph.graph.message import add_messages ,StateGraph
+from langgraph.graph import StateGraph, END, START
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
+from langgraph.prebuilt import ToolNode
+from typing import TypedDict, Annotated, Optional
+from langgraph.graph.message import add_messages
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+from langchain.tools import tool
+from langchain.agents.middleware import wrap_tool_call
+from langchain_core.messages import ToolMessage
+from langchain_openai import AzureChatOpenAI
+import os
+import time
+
+from typing import Literal, Union
+
 from nodes.Researcher import Researcher_Agent
-from nodes.Supervisor import supervisor_Graph
+from nodes.Analyst import Analyst_Graph
+from nodes.Advisor import Advisor_Graph
+from nodes.Supervisor import Supervisor_Graph
+
+
+WorkerType = Literal["Supervisor", "Researcher", "Analyst", "Advisor"]
 
 class InvestmentState(TypedDict):
     # 全局状态
@@ -23,7 +43,9 @@ class InvestmentState(TypedDict):
     needs_clarification: bool          # 是否需要暂停并向用户追问
     clarification_question: str        # 向用户展示的追问内容
     current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
-    last_worker: Optional[str]         # 记录最后执行的子图名称，用于断点恢复
+    
+    last_worker: Optional[WorkerType]          # 记录最后执行的子图
+    next_worker: Optional[Union[WorkerType, Literal["__end__"]]]  # 下一步去向
 
     # ----- 股票标识 -----
     stock_code: Optional[str]
@@ -88,14 +110,47 @@ class InvestmentState(TypedDict):
     }
     """
 
-# # 创建父图、子图
-# def build_parent_graph():
-#     workflow = StateGraph(InvestmentState)
 
-#     researcher_graph = build_researcher_graph()
-#     workflow.add_node("researcher", researcher_graph)
+def next_step_judgment(state: InvestmentState) -> str:
+    next = state.get("next_worker")
+    if next:
+        return next
+    else:
+        print("==== 错误 ====\n找不到next_worker!")
 
-#     # ...其他节点和边
-#     return workflow.compile()
-
+def Stock_Graph_single(state: InvestmentState) -> CompiledStateGraph:
+    workflow = StateGraph(InvestmentState)
     
+    workflow.add_node("Supervisor", Supervisor_Graph)
+    workflow.add_node("Researcher", Researcher_Agent)
+    workflow.add_node("Analyst", Analyst_Graph)
+    workflow.add_node("Advisor", Advisor_Graph)
+
+    workflow.add_edge(START, "Supervisor")
+    workflow.add_edge("Researcher", "Supervisor")
+    workflow.add_edge("Analyst", "Supervisor")
+    workflow.add_edge("Advisor", "Supervisor")
+
+    workflow.add_conditional_edges(
+        "Supervisor",              
+        next_step_judgment
+    )
+
+    return workflow.compile()
+
+
+if __name__ == "__main__":
+    Assistant = Stock_Graph_single()
+
+    initial_state={
+
+    }
+
+    start_time = time.time()
+
+    result = Assistant.invoke()
+
+    end_time = time.time()
+    print(f"\n========== 执行完成 ==========")
+    print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
+    print(f"最终状态：{result}")

@@ -28,7 +28,7 @@ class SupervisorState(TypedDict):
     
     # ----- Supervisor字段 -----
     last_worker: Optional[WorkerType]          # 记录最后执行的子图
-    next_worker: Optional[Union[WorkerType, Literal["end"]]]  # 下一步去向
+    next_worker: Optional[Union[WorkerType, Literal["__end__"]]]  # 下一步去向
     # needs_clarification: bool          # 是否需要暂停并向用户追问
     # clarification_question: str        # 向用户展示的追问内容
     # current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
@@ -231,25 +231,25 @@ def schedule_node(state: SupervisorState) -> dict:
     # 调度表：基于 (intent, last_worker) 映射到下一个 worker 或结束
     # 格式: (intent, last) -> next
     schedule_map = {
-        ("price_check", "Researcher"): "end",
-        ("analyze_only", "Researcher"): "Analyst" if data_available else "end",
-        ("full_advice", "Researcher"): "Analyst" if data_available else "end",
-        ("analyze_only", "Analyst"): "end",
+        ("price_check", "Researcher"): "__end__",
+        ("analyze_only", "Researcher"): "Analyst" if data_available else "__end__",
+        ("full_advice", "Researcher"): "Analyst" if data_available else "__end__",
+        ("analyze_only", "Analyst"): "__end__",
         ("full_advice", "Analyst"): "Advisor",
-        ("full_advice", "Advisor"): "end",
+        ("full_advice", "Advisor"): "__end__",
     }
 
     # 特殊：若意图 unknown，则直接结束
     if intent == "unknown":
         print("[Supervisor] 意图未知，流程结束")
-        return {"next_worker": "end"}
+        return {"next_worker": "__end__"}
 
     key = (intent, last)
     next_worker = schedule_map.get(key)
     if next_worker is None:
         # 默认结束
         print(f"[Supervisor] 未找到调度规则 (intent={intent}, last={last})，默认结束")
-        next_worker = "end"
+        next_worker = "__end__"
 
     print(f"[Supervisor] 调度: last={last}, intent={intent} -> next={next_worker}")
     return {"next_worker": next_worker}
