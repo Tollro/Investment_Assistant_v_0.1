@@ -40,32 +40,24 @@ class InvestmentState(TypedDict):
     intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
     
     # ----- Supervisor 流程控制字段 -----
-    needs_clarification: bool          # 是否需要暂停并向用户追问
-    clarification_question: str        # 向用户展示的追问内容
+    needs_clarification: bool
+    clarification_question: str
     current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
     
-    last_worker: Optional[WorkerType]          # 记录最后执行的子图
-    next_worker: Optional[Union[WorkerType, Literal["__end__"]]]  # 下一步去向
+    last_worker: Optional[WorkerType]
+    next_worker: Optional[Union[WorkerType, Literal["__end__"]]]          # 可以是子图名或 "end"
 
     # ----- 股票标识 -----
     stock_code: Optional[str]
     stock_name: Optional[str]
 
-    # ----- 原始采集数据（结构完全匹配示例）-----
-    collected_data: Optional[Dict[str, Any]]  # 内部结构详见注释
+    # ----- 原始采集数据 -----
+    collected_data: Optional[Dict[str, Any]]
+    data_available: bool                 # Researcher 节点会设置
 
     # ----- 中间分析结果 -----
-    technical_indicators: Optional[Dict[str, Any]]
-    fundamental_analysis: Optional[Dict[str, Any]]
-    sentiment_summary: Optional[Dict[str, Any]]
-
-    # ----- 最终输出内容 -----
-    analysis_summary: Optional[str]
-    recommendation: Optional[str]
-    confidence_score: Optional[float]
-    risk_score: Optional[float]
-    risk_factors: Optional[List[str]]
-    final_decision: Optional[str]
+    analysis: str                        # Analyst 节点输出
+    advices: Dict[str, Any]              # Advisor 节点输出
 
     # ----- 流程控制 -----
     error_info: Optional[str]
@@ -112,19 +104,23 @@ class InvestmentState(TypedDict):
 
 
 def next_step_judgment(state: InvestmentState) -> str:
+    """
+    根据 Supervisor 设置的 next_worker 决定路由目标。
+    """
     next = state.get("next_worker")
     if next:
         return next
     else:
         print("==== 错误 ====\n找不到next_worker!")
+        # return {}
 
-def Stock_Graph_single(state: InvestmentState) -> CompiledStateGraph:
+def Stock_Graph_Single() -> CompiledStateGraph:
     workflow = StateGraph(InvestmentState)
     
-    workflow.add_node("Supervisor", Supervisor_Graph)
-    workflow.add_node("Researcher", Researcher_Agent)
-    workflow.add_node("Analyst", Analyst_Graph)
-    workflow.add_node("Advisor", Advisor_Graph)
+    workflow.add_node("Supervisor", Supervisor_Graph())
+    workflow.add_node("Researcher", Researcher_Agent())
+    workflow.add_node("Analyst", Analyst_Graph())
+    workflow.add_node("Advisor", Advisor_Graph())
 
     workflow.add_edge(START, "Supervisor")
     workflow.add_edge("Researcher", "Supervisor")
@@ -140,17 +136,17 @@ def Stock_Graph_single(state: InvestmentState) -> CompiledStateGraph:
 
 
 if __name__ == "__main__":
-    Assistant = Stock_Graph_single()
+    Assistant = Stock_Graph_Single()
 
+    query = "我想知道茅台走势"
     initial_state={
-
+        "user_query": query,
     }
 
     start_time = time.time()
-
-    result = Assistant.invoke()
-
+    result = Assistant.invoke(initial_state)
     end_time = time.time()
+    
     print(f"\n========== 执行完成 ==========")
     print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
     print(f"最终状态：{result}")

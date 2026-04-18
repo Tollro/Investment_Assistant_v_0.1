@@ -29,7 +29,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from akshare_tools.Data_Fetch import query_by_name_keyword as _query_by_name_keyword, query_by_code as _query_by_code
-from nodes.graph import InvestmentState
+from nodes.Stock_Graph_Single import InvestmentState
 
 def print_messages_simple(messages):
     """简洁打印消息列表，只显示类型、内容和工具调用信息"""

@@ -178,12 +178,12 @@ def llm_based_intent(query: str) -> Literal["price_check", "analyze_only", "full
             options={
                 "temperature": 0.0,        # 消除随机性，保证输出稳定
                 # "num_predict": 50,          # 最大生成 token 数，防止废话
-                "top_p": 0.1               # 极低核采样，增强确定性
+                "top_p": 0.05               # 极低核采样，增强确定性
             }
         )
         # 提取并清洗模型返回内容
         raw_output = response["message"]["content"].strip().lower()
-        print(f"[LLM原始输出] {raw_output[:100]}...")  # 调试用
+        print(f"[LLM原始输出] {raw_output}")  # 调试用
         cleaned = clean_llm_output(raw_output)
         print(f"[LLM清洗后] {cleaned}")
         return cleaned
@@ -222,6 +222,11 @@ def schedule_node(state: SupervisorState) -> dict:
     last = state.get("last_worker")
     data_available = state.get("data_available", False)
 
+    # 特殊：若意图 unknown，则直接结束
+    if intent == "unknown":
+        print("[Supervisor] 意图未知，流程结束")
+        return {"next_worker": "__end__"}
+    
     # 初始进入：last 可能为 None，表示刚从 Supervisor 开始
     if last is None:
         next_worker = "Researcher"
@@ -231,18 +236,16 @@ def schedule_node(state: SupervisorState) -> dict:
     # 调度表：基于 (intent, last_worker) 映射到下一个 worker 或结束
     # 格式: (intent, last) -> next
     schedule_map = {
+        ("price_check", "Supervisor"): "__end__",
         ("price_check", "Researcher"): "__end__",
+        ("analyze_only", "Supervisor"): "Analyst" if data_available else "__end__",
         ("analyze_only", "Researcher"): "Analyst" if data_available else "__end__",
-        ("full_advice", "Researcher"): "Analyst" if data_available else "__end__",
         ("analyze_only", "Analyst"): "__end__",
+        ("full_advice", "Researcher"): "Analyst" if data_available else "__end__",
+        ("full_advice", "Supervisor"): "Analyst" if data_available else "__end__",
         ("full_advice", "Analyst"): "Advisor",
         ("full_advice", "Advisor"): "__end__",
     }
-
-    # 特殊：若意图 unknown，则直接结束
-    if intent == "unknown":
-        print("[Supervisor] 意图未知，流程结束")
-        return {"next_worker": "__end__"}
 
     key = (intent, last)
     next_worker = schedule_map.get(key)
@@ -286,10 +289,7 @@ def Supervisor_Graph() -> CompiledStateGraph:
         START,
         start_condition
     )
-    workflow.add_conditional_edges(
-        "get_intent",
-        intent_condition
-    )
+    workflow.add_edge("get_intent","schedule")
     workflow.add_edge("schedule", END)
 
     return workflow.compile()

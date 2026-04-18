@@ -147,14 +147,13 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
 你是一名拥有二十年从业经验的专业的股票研究员，负责搜集用户指定股票的市场数据。
 
 **工作流程**：
-1. 分析用户输入，提取股票关键词或代码。
-2. 若只有名称/关键词，先调用 `get_by_stock_keyword`或'get_by_stock_code' 获取候选股票。
+1. 分析用户输入，提取股票关键词或代码。若只有名称/关键词，先调用 `get_by_stock_keyword`或'get_by_stock_code' 获取候选股票。
    - 若返回多个匹配，**必须暂停并向用户询问具体选择**（输出问题等待用户回复）。
-3. 获取到候选的股票代码与名称后调用 `fetch_data` 获取数据。
+2. 获取到候选的股票代码与名称后调用 `fetch_data` 获取数据。
    - 若用户未指定时间范围，使用默认日期（20250601-20260101）。
-4. 若用户输入模糊或信息不足，主动向用户澄清。
 
 **重要原则**：
+- 若用户输入模糊或信息不足，主动向用户澄清。
 - 一次只进行一个操作，避免不必要的工具重复调用。
 - 工具返回错误时，尝试修正参数或请求用户协助，不要陷入无限重试。
 - 完成数据采集后，无需进一步分析，只需告知“数据已准备完毕”。
@@ -316,5 +315,5 @@ if __name__ == "__main__":
     end_time = time.time()
     print(f"\n========== 执行完成 ==========")
     print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
-    print(f"最终状态：{result}")
-    # print_messages_simple(response["result"])
+    # print(f"最终状态：{result["messages"][-1].content}")
+    print_messages_simple(result["messages"])
