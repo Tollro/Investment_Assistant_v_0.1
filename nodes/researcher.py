@@ -14,17 +14,13 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph.message import add_messages
 from langchain_core.messages import BaseMessage
 from langgraph.prebuilt import ToolNode
-from typing import TypedDict, Annotated, Optional
-from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
+from langgraph.types import interrupt, Command
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain.tools import tool
 from langchain.agents.middleware import wrap_tool_call
-from langchain_core.messages import ToolMessage
 from langchain_openai import AzureChatOpenAI
 import os
 import time
-
-from typing import Literal
 from pydantic import BaseModel, Field
 
 from akshare_tools.Data_Fetch import get_all_data, query_by_name_keyword as _query_by_name_keyword, query_by_code as _query_by_code
@@ -60,6 +56,7 @@ def print_messages_simple(messages):
 class ResearcherState(TypedDict):
     """Researcher Agent State"""
     messages: Annotated[List[BaseMessage], add_messages]
+    conversation_history: Annotated[List[BaseMessage], add_messages]
     fetch_times: int
 
     # 同步全局 InvestmentState
@@ -143,12 +140,13 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
         raise ValueError("llm_with_tools must be provided to call_llm.")
     
     # 注意！！需要重新写prompt
-    system_prompt="""
-你是一名拥有二十年从业经验的专业的股票研究员，负责搜集用户指定股票的市场数据。
+    system_prompt=f"""
+你是一名拥有二十年从业经验的专业的股票研究员，负责搜集用户指定股票的市场数据。你收集到的数据会交给专业的分析师进行分析。
+用户意图：{state.get("intent", "unkonwn")}
 
 **工作流程**：
 1. 分析用户输入，提取股票关键词或代码。若只有名称/关键词，先调用 `get_by_stock_keyword`或'get_by_stock_code' 获取候选股票。
-   - 若返回多个匹配，**必须暂停并向用户询问具体选择**（输出问题等待用户回复）。
+   - 如果工具返回多个匹配，系统会自动向用户询问选择，你无需处理。
 2. 获取到候选的股票代码与名称后调用 `fetch_data` 获取数据。
    - 若用户未指定时间范围，使用默认日期（20250601-20260101）。
 
@@ -156,7 +154,7 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
 - 若用户输入模糊或信息不足，主动向用户澄清。
 - 一次只进行一个操作，避免不必要的工具重复调用。
 - 工具返回错误时，尝试修正参数或请求用户协助，不要陷入无限重试。
-- 完成数据采集后，无需进一步分析，只需告知“数据已准备完毕”。
+- 完成数据采集后，无需进一步分析，只需告知“XX(股票名称)的数据已准备完毕”。
 """
 
     messages = state.get("messages", [])
@@ -170,7 +168,10 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
             messages.insert(0, SystemMessage(content=system_prompt))
 
     response = llm_with_tools.invoke(messages)
-    return {"messages": [response]}
+    return {
+        "messages": [response],
+        "conversation_history": [response]
+    }
 
 
 def update_state_from_tool(state: ResearcherState) -> dict:
@@ -180,6 +181,7 @@ def update_state_from_tool(state: ResearcherState) -> dict:
         return {}
 
     last_msg = messages[-1]
+    updates = {}
 
     # 处理 fetch_data 工具返回
     if isinstance(last_msg, ToolMessage) and last_msg.name == "fetch_data":
@@ -216,12 +218,80 @@ def update_state_from_tool(state: ResearcherState) -> dict:
             result = json.loads(last_msg.content)
         except:
             return {}
-        if "stock_code" in result and "stock_name" in result:
+        # 情况1：错误信息 - 未找到股票
+        if "error" in result and "未找到" in result["error"]:
+            error_msg = result["error"]
+            assistant_prompt = AIMessage(content=f"{error_msg} 请提供更准确的股票名称或代码。")
+            # 触发中断，等待用户重新输入
+            user_new_input = interrupt({
+                "type": "not_found",
+                "question": f"{error_msg} 请重新输入股票名称或代码：",
+                "original_query": state.get("user_query", "")
+            })
+            # 用户输入后，将用户的新输入作为 HumanMessage 加入历史和消息流
+            user_msg = HumanMessage(content=user_new_input)
+            return {
+                "conversation_history": [assistant_prompt, user_msg],
+                "messages": [user_msg],          # 让LLM继续处理新输入
+                "user_query": user_new_input,    # 更新当前查询
+                "fetch_times": 0,                # 重置重试计数
+            }
+        elif "multiple_matches" in result:
+            options = result["multiple_matches"]
+            # 构建提问消息（将作为AI助手消息写入历史）
+            question_content = f"找到多个匹配的股票，请选择：\n"
+            for i, opt in enumerate(options, 1):
+                question_content += f"{i}. {opt['name']} ({opt['code']})\n"
+            question_content += "请输入序号或完整代码。"
+
+            # 将提问写入全局对话历史
+            assistant_question = AIMessage(content=question_content)
+            
+            # 使用 interrupt 暂停图执行，并携带选项数据供前端展示
+            user_choice = interrupt({
+                "type": "multiple_matches",
+                "question": question_content,
+                "options": options
+            })
+
+            # 当用户通过 Command(resume=...) 恢复后，user_choice 即为用户输入
+            # 解析用户输入（例如序号或代码）
+            selected = parse_user_selection(user_choice, options)
+            if selected:
+                return {
+                    "stock_code": selected["code"],
+                    "stock_name": selected["name"],
+                    "conversation_history": [assistant_question]  # 将提问加入历史
+                }
+            else:
+                # 若解析失败，可再次中断或返回错误
+                error_msg = AIMessage(content="输入无效，请重新选择。")
+                return {
+                    "conversation_history": [assistant_question, error_msg],
+                    # 可以设置一个标记让LLM重新处理
+                }
+
+        elif "stock_code" in result and "stock_name" in result:
             return {
                 "stock_code": result["stock_code"],
                 "stock_name": result["stock_name"]
             }
     return {}
+
+
+def parse_user_selection(user_input: str, options: list) -> dict | None:
+    """解析用户的选择（支持序号或代码）。"""
+    user_input = user_input.strip()
+    # 尝试按序号匹配
+    if user_input.isdigit():
+        idx = int(user_input) - 1
+        if 0 <= idx < len(options):
+            return options[idx]
+    # 尝试按代码匹配
+    for opt in options:
+        if opt["code"].endswith(user_input) or user_input == opt["code"]:
+            return opt
+    return None
 
 
 def should_continue(state: ResearcherState) -> Literal["tool_node", "__end__"]:
@@ -300,7 +370,7 @@ def Researcher_Agent() -> CompiledStateGraph:
 
 if __name__ == "__main__":
     agent = Researcher_Agent()
-    query = "我想查询茅台的相关信息"
+    query = "我想查询华的相关信息"
     initial_state = {
         "user_query": query,
         "fetch_times": 0,
@@ -308,12 +378,28 @@ if __name__ == "__main__":
         "stock_code": None,
         "stock_name": None,
         "collected_data": None,
-        "data_available": False
+        "data_available": False,
+        "conversation_history": []
     }
     start_time = time.time()
-    result = agent.invoke(initial_state)
+
+    # 使用 stream 处理可能的中断
+    config = {"configurable": {"thread_id": "test_researcher"}}
+    for event in agent.stream(initial_state, config):
+        if "__interrupt__" in event:
+            interrupt_data = event["__interrupt__"][0]
+            print("\n[中断] 问题：", interrupt_data["question"])
+            user_response = input("你的回答：")
+            # 恢复执行
+            for e in agent.stream(Command(resume=user_response), config):
+                if "__interrupt__" in e:
+                    # 可能再次中断（例如无效选择）
+                    print("再次中断：", e["__interrupt__"][0]["question"])
+        else:
+            # 普通输出
+            pass
     end_time = time.time()
     print(f"\n========== 执行完成 ==========")
-    print(f"单轮总耗时：{end_time - start_time:.4f} 秒")
+    print(f"总耗时：{end_time - start_time:.4f} 秒")
     # print(f"最终状态：{result["messages"][-1].content}")
-    print_messages_simple(result["messages"])
+    # print_messages_simple(result["messages"])

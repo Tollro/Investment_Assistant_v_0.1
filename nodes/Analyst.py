@@ -52,6 +52,7 @@ class AnalystState(TypedDict):
     stock_code: Optional[str]
     stock_name: Optional[str]
     collected_data: Optional[Dict[str, Any]]
+    data_available: bool
     analysis: str
 
 

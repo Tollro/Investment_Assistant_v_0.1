@@ -216,6 +216,18 @@ def get_intent_node(state: SupervisorState) -> dict:
     return {"intent": "unknown"}
 
 
+def update_woker_node(state: SupervisorState) -> dict:
+    print("进入任务调度状态更新节点......")
+    last = state.get("last_worker")
+    next = state.get("next_worker")
+    if not last:
+        return {"last_worker": "Supervisor"}
+    if not next:
+        print("next == none，不应该出现此错误！")
+    last = next
+    return {"last_worker": last}
+
+
 def schedule_node(state: SupervisorState) -> dict:
     print("\n进入schedule_node... ...")
     intent = state.get("intent", "unknown")
@@ -227,22 +239,22 @@ def schedule_node(state: SupervisorState) -> dict:
         print("[Supervisor] 意图未知，流程结束")
         return {"next_worker": "__end__"}
     
-    # 初始进入：last 可能为 None，表示刚从 Supervisor 开始
-    if last is None:
-        next_worker = "Researcher"
-        print(f"[Supervisor] 初始调度 -> Researcher")
-        return {"next_worker": next_worker, "last_worker": "Supervisor"}
+    # # 初始进入：last 可能为 None，表示刚从 Supervisor 开始
+    # if last is None:
+    #     next_worker = "Researcher"
+    #     print(f"[Supervisor] 初始调度 -> Researcher")
+    #     return {"next_worker": next_worker, "last_worker": "Supervisor"}
 
     # 调度表：基于 (intent, last_worker) 映射到下一个 worker 或结束
     # 格式: (intent, last) -> next
     schedule_map = {
-        ("price_check", "Supervisor"): "__end__",
+        ("price_check", "Supervisor"): "Researcher",
         ("price_check", "Researcher"): "__end__",
-        ("analyze_only", "Supervisor"): "Analyst" if data_available else "__end__",
+        ("analyze_only", "Supervisor"): "Researcher",
         ("analyze_only", "Researcher"): "Analyst" if data_available else "__end__",
         ("analyze_only", "Analyst"): "__end__",
         ("full_advice", "Researcher"): "Analyst" if data_available else "__end__",
-        ("full_advice", "Supervisor"): "Analyst" if data_available else "__end__",
+        ("full_advice", "Supervisor"): "Researcher",
         ("full_advice", "Analyst"): "Advisor",
         ("full_advice", "Advisor"): "__end__",
     }
@@ -282,11 +294,13 @@ def Supervisor_Graph() -> CompiledStateGraph:
     """
     workflow = StateGraph(SupervisorState)
 
+    workflow.add_node("update", update_woker_node)
     workflow.add_node("get_intent", get_intent_node)
     workflow.add_node("schedule", schedule_node)
 
+    workflow.add_edge(START, "update")
     workflow.add_conditional_edges(
-        START,
+        "update",
         start_condition
     )
     workflow.add_edge("get_intent","schedule")
