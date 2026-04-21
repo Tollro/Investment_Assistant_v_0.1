@@ -16,6 +16,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.prebuilt import ToolNode
 from langgraph.types import interrupt, Command
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langgraph.checkpoint.memory import MemorySaver
 from langchain.tools import tool
 from langchain.agents.middleware import wrap_tool_call
 from langchain_openai import AzureChatOpenAI
@@ -139,6 +140,30 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
     if llm_with_tools is None:
         raise ValueError("llm_with_tools must be provided to call_llm.")
     
+    # 如果股票已选定但数据未就绪，直接生成工具调用，不经过LLM
+    stock_code = state.get("stock_code")
+    stock_name = state.get("stock_name")
+    data_available = state.get("data_available", False)
+    
+    if stock_code and stock_name and not data_available:
+        print(f"[Researcher] 检测到已选定股票 {stock_name}({stock_code})，直接调用 fetch_data 工具。")
+        tool_call_msg = AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "fetch_data",
+                "args": {
+                    "symbol": stock_code,
+                    "start_date": "20250601",
+                    "end_date": "20260101"
+                },
+                "id": f"call_fetch_{int(time.time())}"  # 简单生成唯一ID
+            }]
+        )
+        return {
+            "messages": [tool_call_msg],
+            "conversation_history": [tool_call_msg]
+        }
+    
     # 注意！！需要重新写prompt
     system_prompt=f"""
 你是一名拥有二十年从业经验的专业的股票研究员，负责搜集用户指定股票的市场数据。你收集到的数据会交给专业的分析师进行分析。
@@ -238,38 +263,30 @@ def update_state_from_tool(state: ResearcherState) -> dict:
             }
         elif "multiple_matches" in result:
             options = result["multiple_matches"]
-            # 构建提问消息（将作为AI助手消息写入历史）
-            question_content = f"找到多个匹配的股票，请选择：\n"
-            for i, opt in enumerate(options, 1):
-                question_content += f"{i}. {opt['name']} ({opt['code']})\n"
-            question_content += "请输入序号或完整代码。"
-
-            # 将提问写入全局对话历史
-            assistant_question = AIMessage(content=question_content)
+            # 构建选项列表文本（仅用于展示，不存入历史）
+            option_lines = [f"{i+1}. {opt['name']} ({opt['code']})" for i, opt in enumerate(options)]
+            question_content = "找到多个匹配的股票，请选择：\n" + "\n".join(option_lines) + "\n请输入序号或完整代码。"
             
-            # 使用 interrupt 暂停图执行，并携带选项数据供前端展示
-            user_choice = interrupt({
-                "type": "multiple_matches",
-                "question": question_content,
-                "options": options
-            })
-
-            # 当用户通过 Command(resume=...) 恢复后，user_choice 即为用户输入
-            # 解析用户输入（例如序号或代码）
-            selected = parse_user_selection(user_choice, options)
-            if selected:
-                return {
-                    "stock_code": selected["code"],
-                    "stock_name": selected["name"],
-                    "conversation_history": [assistant_question]  # 将提问加入历史
-                }
-            else:
-                # 若解析失败，可再次中断或返回错误
-                error_msg = AIMessage(content="输入无效，请重新选择。")
-                return {
-                    "conversation_history": [assistant_question, error_msg],
-                    # 可以设置一个标记让LLM重新处理
-                }
+            # 循环直到用户输入有效
+            while True:
+                user_choice = interrupt({
+                    "type": "multiple_matches",
+                    "question": question_content,
+                    "options": options
+                })
+                selected = parse_user_selection(user_choice, options)
+                if selected:
+                    break
+                # 无效输入，更新提示内容，继续中断
+                question_content = f"输入 '{user_choice}' 无效，请重新输入序号或完整代码。"
+            
+            # 用户选择成功，生成一条简短的确认消息加入历史
+            confirm_msg = AIMessage(content=f"已选择：{selected['name']} ({selected['code']})，正在获取数据……")
+            return {
+                "stock_code": selected["code"],
+                "stock_name": selected["name"],
+                "conversation_history": [confirm_msg]   # ✅ 只写确认消息
+            }
 
         elif "stock_code" in result and "stock_name" in result:
             return {
@@ -365,7 +382,7 @@ def Researcher_Agent() -> CompiledStateGraph:
         {"llm": "llm", END: END}
     )
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=MemorySaver())
 
 
 if __name__ == "__main__":
@@ -385,19 +402,22 @@ if __name__ == "__main__":
 
     # 使用 stream 处理可能的中断
     config = {"configurable": {"thread_id": "test_researcher"}}
-    for event in agent.stream(initial_state, config):
-        if "__interrupt__" in event:
-            interrupt_data = event["__interrupt__"][0]
-            print("\n[中断] 问题：", interrupt_data["question"])
-            user_response = input("你的回答：")
-            # 恢复执行
-            for e in agent.stream(Command(resume=user_response), config):
-                if "__interrupt__" in e:
-                    # 可能再次中断（例如无效选择）
-                    print("再次中断：", e["__interrupt__"][0]["question"])
-        else:
-            # 普通输出
-            pass
+
+    def run_stream(input_state, config):
+        for event in agent.stream(input_state, config):
+            if "__interrupt__" in event:
+                interrupt_obj = event["__interrupt__"][0]
+                data = interrupt_obj.value
+                print("\n[中断] 问题：", data["question"])
+                user_response = input("你的回答：")
+                # 用 Command 恢复执行，继续递归处理可能的新中断
+                run_stream(Command(resume=user_response), config)
+                return  # 恢复后本次 stream 结束，由递归调用的 stream 接管后续事件
+            else:
+                # 打印非中断事件，便于观察流程
+                print(event)
+    
+    run_stream(initial_state, config)
     end_time = time.time()
     print(f"\n========== 执行完成 ==========")
     print(f"总耗时：{end_time - start_time:.4f} 秒")
