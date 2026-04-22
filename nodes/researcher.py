@@ -391,7 +391,7 @@ if __name__ == "__main__":
     initial_state = {
         "user_query": query,
         "fetch_times": 0,
-        "intent": "unknown",
+        "intent": "price_check",
         "stock_code": None,
         "stock_name": None,
         "collected_data": None,
@@ -419,6 +419,7 @@ if __name__ == "__main__":
     
     run_stream(initial_state, config)
     end_time = time.time()
+    
     print(f"\n========== 执行完成 ==========")
     print(f"总耗时：{end_time - start_time:.4f} 秒")
     # print(f"最终状态：{result["messages"][-1].content}")

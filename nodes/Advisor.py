@@ -47,6 +47,7 @@ class AdvisorState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
 
     # 同步全局 InvestmentState
+    conversation_history: Annotated[List[BaseMessage], add_messages]
     user_query: str
     intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
 
