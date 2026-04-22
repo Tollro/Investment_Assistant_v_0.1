@@ -33,7 +33,6 @@ class SupervisorState(TypedDict):
     stock_code: Optional[str]
     stock_name: Optional[str]
     data_available: bool
-    # 可根据需要添加更多字段
 
 
 # ---------- 语义向量工具（保持不变）----------
@@ -68,7 +67,7 @@ INTENT_EMBEDDINGS = {
 # ---------- 意图识别（保持不变）----------
 def rule_based_intent(query: str) -> str:
     q = query.lower()
-    if any(kw in q for kw in ["价格", "报价", "多少钱", "实时", "现价", "涨跌幅", "涨了", "跌了"]):
+    if any(kw in q for kw in ["查询", "价格", "报价", "多少钱", "实时", "现价", "涨跌幅", "涨了", "跌了"]):
         return "price_check"
     if any(kw in q for kw in ["分析", "走势", "技术面", "k线", "指标", "形态", "趋势"]):
         return "analyze_only"
@@ -93,6 +92,7 @@ def clean_llm_output(raw: str) -> str:
             return label
     return "unknown"
 
+
 def llm_based_intent(query: str) -> str:
     prompt = f"""你是金融意图分类器，仅输出以下四个标签之一：
 - price_check：查询价格/报价/涨跌幅
@@ -115,6 +115,7 @@ def llm_based_intent(query: str) -> str:
     except Exception as e:
         print(f"[LLM错误] {e}")
         return "unknown"
+
 
 def hybrid_recognize_intent(query: str) -> str:
     rule = rule_based_intent(query)
@@ -164,8 +165,8 @@ def schedule_node(state: SupervisorState) -> dict:
 
     # 若意图未知，直接结束
     if intent == "unknown":
-        print("[Supervisor] 意图未知，流程终止")
-        return {"next_worker": "__end__"}
+        print("[Supervisor] 意图未知，转交Responder处理")
+        return {"next_worker": "Responder"}
 
     # 定义调度表：(intent, last_worker) -> next_worker
     # 注意：last_worker 为 None 或 "Supervisor" 都表示初始状态
@@ -173,20 +174,20 @@ def schedule_node(state: SupervisorState) -> dict:
         # 价格查询流程
         ("price_check", None): "Researcher",
         ("price_check", "Supervisor"): "Researcher",
-        ("price_check", "Researcher"): "__end__",
+        ("price_check", "Researcher"): "Responder",
 
         # 仅分析流程
         ("analyze_only", None): "Researcher",
         ("analyze_only", "Supervisor"): "Researcher",
         ("analyze_only", "Researcher"): "Analyst" if data_available else "Researcher",
-        ("analyze_only", "Analyst"): "__end__",
+        ("analyze_only", "Analyst"): "Responder",
 
         # 完整建议流程
         ("full_advice", None): "Researcher",
         ("full_advice", "Supervisor"): "Researcher",
         ("full_advice", "Researcher"): "Analyst" if data_available else "Researcher",
         ("full_advice", "Analyst"): "Advisor",
-        ("full_advice", "Advisor"): "__end__",
+        ("full_advice", "Advisor"): "Responder",
     }
 
     key = (intent, last)
@@ -199,7 +200,7 @@ def schedule_node(state: SupervisorState) -> dict:
 
     if next_worker is None:
         print(f"[Supervisor] 无调度规则 (intent={intent}, last={last})，默认结束")
-        next_worker = "__end__"
+        next_worker = "Responder"
 
     print(f"[Supervisor] 调度: last={last}, intent={intent}, data_available={data_available} -> next={next_worker}")
     return {"next_worker": next_worker}

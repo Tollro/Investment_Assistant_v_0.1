@@ -1,5 +1,5 @@
 """
-Responder节点：根据历史消息生成回复
+Responder节点：根据历史消息生成回复，并重置状态
 """
 import sys
 from pathlib import Path
@@ -7,195 +7,181 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-import json
-from typing import TypedDict, List, Dict, Any, Optional, Literal, Annotated
+from typing import TypedDict, List, Dict, Any, Optional, Literal, Annotated, Union
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage
-from langgraph.prebuilt import ToolNode
-from langgraph.types import interrupt, Command
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, AIMessage
 from langgraph.checkpoint.memory import MemorySaver
-from langchain.tools import tool
-from langchain.agents.middleware import wrap_tool_call
 from langchain_openai import AzureChatOpenAI
 import os
-import time
-from pydantic import BaseModel, Field
 
+WorkerType = Literal["Supervisor", "Researcher", "Analyst", "Advisor"]
 
-def print_messages_simple(messages):
-    """简洁打印消息列表，只显示类型、内容和工具调用信息"""
-    for i, msg in enumerate(messages):
-        msg_type = msg.__class__.__name__
-        print(f"\n--- 第 {i+1} 条消息 ({msg_type}) ---")
-        
-        if msg_type == "HumanMessage":
-            print(f"内容: {msg.content}")
-        elif msg_type == "AIMessage":
-            if msg.content:
-                print(f"内容: {msg.content}")
-            if hasattr(msg, "tool_calls") and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    print(f"调用工具: {tc['name']}, 参数: {tc['args']}")
-        elif msg_type == "ToolMessage":
-            print(f"工具名称: {msg.name}")
-
-            # 如果返回内容过长可截断显示
-            content = msg.content
-            if len(content) > 200:
-                content = content[:200] + "..."
-                
-            print(f"返回内容: {content}")
-        else:
-            print(f"agent回复内容: {msg.content}")
-
-
-class ResearcherState(TypedDict):
-    """Researcher Agent State"""
-    messages: Annotated[List[BaseMessage], add_messages]
+class ResponderState(TypedDict):
+    """Responder Graph State"""
+    # 全局状态
     conversation_history: Annotated[List[BaseMessage], add_messages]
-    fetch_times: int
-
-    # 同步全局 InvestmentState
+    messages: Annotated[List[BaseMessage], add_messages]
     user_query: str
     intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
+    
+    # ----- Supervisor 流程控制字段 -----
+    needs_clarification: bool
+    clarification_question: str
+    current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
+    
+    last_worker: Optional[WorkerType]
+    next_worker: Optional[Union[WorkerType, Literal["__end__"]]]
 
+    # ----- 股票标识 -----
     stock_code: Optional[str]
     stock_name: Optional[str]
+
+    # ----- 原始采集数据 -----
     collected_data: Optional[Dict[str, Any]]
     data_available: bool
+
+    # ----- 中间分析结果 -----
+    analysis: str
+    advices: Dict[str, Any]              # Advisor 节点输出
+    response: str                        # Responder 节点输出
 
 
 def create_llm(temperature: float) -> AzureChatOpenAI:
     llm = AzureChatOpenAI(
-                azure_endpoint=os.getenv("AZURE_GPT4O_ENDPOINT"),
-                api_key=os.getenv("AZURE_GPT4O_API_KEY"),
-                api_version="2025-01-01-preview",
-                model="gpt-4o",
-                temperature=temperature
-            )
+        azure_endpoint=os.getenv("AZURE_GPT4O_ENDPOINT"),
+        api_key=os.getenv("AZURE_GPT4O_API_KEY"),
+        api_version="2025-01-01-preview",
+        model="gpt-4o",
+        temperature=temperature,
+        timeout=15,           # 请求超时（秒）
+        max_retries=4,   # 重试次数
+    )
     if not llm:
         raise ValueError("Azure OpenAI 模型初始化失败，请检查环境变量设置。")
-    else:
-        # print("✅ Azure OpenAI 模型初始化成功！")
-        return llm
+    return llm
 
 
-def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
-    if llm_with_tools is None:
-        raise ValueError("llm_with_tools must be provided to call_llm.")
-    
-    # 如果股票已选定但数据未就绪，直接生成工具调用，不经过LLM
-    stock_code = state.get("stock_code")
-    stock_name = state.get("stock_name")
-    data_available = state.get("data_available", False)
-    
-    if stock_code and stock_name and not data_available:
-        print(f"[Researcher] 检测到已选定股票 {stock_name}({stock_code})，直接调用 fetch_data 工具。")
-        tool_call_msg = AIMessage(
-            content="",
-            tool_calls=[{
-                "name": "fetch_data",
-                "args": {
-                    "symbol": stock_code,
-                    "start_date": "20250601",
-                    "end_date": "20260101"
-                },
-                "id": f"call_fetch_{int(time.time())}"  # 简单生成唯一ID
-            }]
-        )
-        return {
-            "messages": [tool_call_msg],
-            "conversation_history": [tool_call_msg]
-        }
-    
-    # 注意！！需要重新写prompt
-    system_prompt=f"""
-你是一名拥有二十年从业经验的专业的股票研究员，负责搜集用户指定股票的市场数据。你收集到的数据会交给专业的分析师进行分析。
-用户意图：{state.get("intent", "unkonwn")}
+def call_llm_response(state: ResponderState, llm=None) -> dict:
+    """
+    调用 LLM 生成面向最终用户的回复。
+    """
+    if llm is None:
+        raise ValueError("llm must be provided to call_llm_response.")
 
-**工作流程**：
-1. 分析用户输入，提取股票关键词或代码。若只有名称/关键词，先调用 `get_by_stock_keyword`或'get_by_stock_code' 获取候选股票。
-   - 如果工具返回多个匹配，系统会自动向用户询问选择，你无需处理。
-2. 获取到候选的股票代码与名称后调用 `fetch_data` 获取数据。
-   - 若用户未指定时间范围，使用默认日期（20250601-20260101）。
+    user_query = state.get("user_query", "")
+    stock_name = state.get("stock_name", "该股票")
+    intent = state.get("intent", "unknown")
+    analysis = state.get("analysis", "")
+    advices = state.get("advices", {})
 
-**重要原则**：
-- 若用户输入模糊或信息不足，主动向用户澄清。
-- 一次只进行一个操作，避免不必要的工具重复调用。
-- 工具返回错误时，尝试修正参数或请求用户协助，不要陷入无限重试。
-- 完成数据采集后，无需进一步分析，只需告知“XX(股票名称)的数据已准备完毕”。
+    # ----- 系统提示设计 -----
+    system_prompt = """
+你是一名专业的金融客服助手，负责向用户清晰、准确地传达股票分析和投资建议。
+你的回复将直接展示给用户，请确保语言专业、友善、条理清晰。
+
+**回复原则**：
+1. 根据用户的问题意图调整回复重点：
+   - 若用户仅询问价格（price_check），需告知最新价格、涨跌幅、最近一个月的周线数据、月线数据(如果用户没要求默认给月线数据)还有财务信息，无需展开分析。
+   - 若用户要求分析（analyze_only），应客观陈述给出的分析中的各情况，**不主动提供买卖建议**。
+   - 若用户寻求投资建议（full_advice），可结合专业分析给出短中长期的操作参考，但需添加风险提示。
+2. 回复结构建议：
+   - 开头：确认股票名称，回应问题核心。
+   - 主体：根据意图展示相关内容（价格、分析要点、建议等）。
+   - 结尾：可附加一句免责声明（如“以上分析仅供参考，不构成投资建议”）。
+3. 避免输出未提供的信息，不编造数据。若某些信息缺失，诚实告知用户。
+4. 语气亲切自然，适当使用“您”等敬语。
+5. 输出纯文本，不使用 Markdown 表格或代码块。
+6. 若没有任何数据，直接回复"抱歉，暂时找不到任何信息"
 """
 
-    messages = state.get("messages", [])
-    if not messages:
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=state["user_query"])
-        ]
+    # ----- 构造人类消息（包含具体数据）-----
+    # 根据意图定制数据呈现
+    if intent == "price_check":
+        data_section = f"""
+        相关价格数据：{state.get('collected_data', {}).get('market_data', {})} 
+        相关财务报表：{state.get('collected_data', {}).get("financial_reports", {})}
+        """
     else:
-        if not isinstance(messages[0], SystemMessage):
-            messages.insert(0, SystemMessage(content=system_prompt))
+        data_section = f"""
+专业分析报告：
+{analysis if analysis else "（暂无详细分析）"}
 
-    response = llm_with_tools.invoke(messages)
+专业投资建议（JSON格式）：
+{advices if advices else "（暂无具体建议）"}
+"""
+
+    human_content = f"""
+用户提问：{user_query}
+股票名称：{stock_name}（{state.get('stock_code', '')}）
+用户意图：{intent}
+
+以下是您需要参考的资料：
+{data_section}
+
+请根据上述信息生成对用户的最终回复。
+"""
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=human_content)
+    ]
+
+    # 调用 LLM
+    response_msg = llm.invoke(messages)
+    reply_text = response_msg.content.strip()
+
+    # 更新 conversation_history 和 response / final_response 字段
     return {
-        "messages": [response],
-        "conversation_history": [response]
+        "messages": [response_msg],
+        "conversation_history": [response_msg],
+        "response": reply_text,
+        "next_worker": "__end__"           # 标记流程结束，便于父图调度
     }
 
 
-def Researcher_Agent() -> CompiledStateGraph:
+def Responder_Graph() -> CompiledStateGraph:
     llm = create_llm(temperature=0.2)
 
-    llm_with_tools = llm.bind_tools(tools)
+    workflow = StateGraph(ResponderState)
 
-    workflow = StateGraph(ResearcherState)
+    workflow.add_node("llm", lambda state: call_llm_response(state, llm))
 
-    workflow.add_node("llm", lambda state: call_llm_with_tools(state, llm_with_tools))
-    workflow.add_node("tool_node", tool_node)
-
+    workflow.add_edge(START, "llm")
+    workflow.add_edge("llm", END)
 
     return workflow.compile(checkpointer=MemorySaver())
 
 
 if __name__ == "__main__":
-    agent = Researcher_Agent()
-    query = "我想查询华的相关信息"
-    initial_state = {
-        "user_query": query,
-        "fetch_times": 0,
-        "intent": "price_check",
-        "stock_code": None,
-        "stock_name": None,
-        "collected_data": None,
-        "data_available": False,
-        "conversation_history": []
+    # 简单测试示例
+    graph = Responder_Graph()
+    test_state = {
+        "user_query": "茅台能买吗？",
+        "intent": "full_advice",
+        "stock_code": "600519",
+        "stock_name": "贵州茅台",
+        "analysis": "贵州茅台基本面稳健，ROE长期维持在30%以上，近期股价在1600-1700元区间震荡。",
+        "advices": {
+            "short_term": {"suggestion": "观望", "reasoning": "短期技术指标偏弱"},
+            "mid_term": {"suggestion": "持有", "reasoning": "消费复苏预期"},
+            "long_term": {"suggestion": "增持", "reasoning": "品牌护城河深厚"}
+        },
+        "conversation_history": [],
+        "needs_clarification": False,
+        "clarification_question": "",
+        "current_phase": "reporting",
+        "last_worker": "Advisor",
+        "next_worker": None,
+        "collected_data": {"market_data": {"realtime": {"price": 1680.00}}},
+        "data_available": True,
+        "response": "",
+        "error_info": None,
+        "retry_count": 0,
+        "final_response": None
     }
-    start_time = time.time()
-
-    # 使用 stream 处理可能的中断
-    config = {"configurable": {"thread_id": "test_researcher"}}
-
-    def run_stream(input_state, config):
-        for event in agent.stream(input_state, config):
-            if "__interrupt__" in event:
-                interrupt_obj = event["__interrupt__"][0]
-                data = interrupt_obj.value
-                print("\n[中断] 问题：", data["question"])
-                user_response = input("你的回答：")
-                # 用 Command 恢复执行，继续递归处理可能的新中断
-                run_stream(Command(resume=user_response), config)
-                return  # 恢复后本次 stream 结束，由递归调用的 stream 接管后续事件
-            else:
-                # 打印非中断事件，便于观察流程
-                print(event)
-    
-    run_stream(initial_state, config)
-    end_time = time.time()
-    
-    print(f"\n========== 执行完成 ==========")
-    print(f"总耗时：{end_time - start_time:.4f} 秒")
-    # print(f"最终状态：{result["messages"][-1].content}")
-    # print_messages_simple(result["messages"])
+    config = {"configurable": {"thread_id": "test_responder"}}
+    result = graph.invoke(test_state, config)
+    print("\n===== 最终回复 =====\n")
+    print(result.get("final_response"))

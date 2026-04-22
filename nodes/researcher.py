@@ -23,6 +23,7 @@ from langchain_openai import AzureChatOpenAI
 import os
 import time
 from pydantic import BaseModel, Field
+import datetime
 
 from akshare_tools.Data_Fetch import get_all_data, query_by_name_keyword as _query_by_name_keyword, query_by_code as _query_by_code
 
@@ -72,13 +73,14 @@ class ResearcherState(TypedDict):
 
 class GetStockAllDataInput(BaseModel):
     symbol: str = Field(description="股票代码（必须包含前缀），如 'sz000001'")
-    start_date: str = Field(description="开始日期 YYYYMMDD", default="20250601")
-    end_date: str = Field(description="结束日期 YYYYMMDD", default="20260101")
+    start_date: str = Field(description="开始日期 YYYYMMDD")
+    end_date: str = Field(description="结束日期 YYYYMMDD")
 
 
 @tool(args_schema=GetStockAllDataInput)
-def fetch_data(symbol: str, start_date="20250601", end_date="20260101")->dict:
+def fetch_data(symbol: str, start_date=(datetime.date.today()-datetime.timedelta(days=182)).strftime("%Y%m%d"), end_date=datetime.date.today().strftime("%Y%m%d"))->dict:
     """获取指定股票在日期范围内的行情、财务等综合信息，返回JSON格式。"""
+    print(f"[fetch_data] 调用参数: symbol={symbol}, start={start_date}, end={end_date}")
     result = get_all_data(symbol, start_date, end_date)
     if result == None:
         return {"error": "数据获取失败，请检查股票代码是否正确或稍后重试"}
@@ -127,7 +129,9 @@ def create_llm(temperature: float) -> AzureChatOpenAI:
                 api_key=os.getenv("AZURE_GPT4O_API_KEY"),
                 api_version="2025-01-01-preview",
                 model="gpt-4o",
-                temperature=temperature
+                temperature=temperature,
+                timeout=15,           # 请求超时（秒）
+                max_retries=4,   # 重试次数
             )
     if not llm:
         raise ValueError("Azure OpenAI 模型初始化失败，请检查环境变量设置。")
@@ -145,41 +149,28 @@ def call_llm_with_tools(state: ResearcherState, llm_with_tools=None) -> dict:
     stock_name = state.get("stock_name")
     data_available = state.get("data_available", False)
     
-    if stock_code and stock_name and not data_available:
-        print(f"[Researcher] 检测到已选定股票 {stock_name}({stock_code})，直接调用 fetch_data 工具。")
-        tool_call_msg = AIMessage(
-            content="",
-            tool_calls=[{
-                "name": "fetch_data",
-                "args": {
-                    "symbol": stock_code,
-                    "start_date": "20250601",
-                    "end_date": "20260101"
-                },
-                "id": f"call_fetch_{int(time.time())}"  # 简单生成唯一ID
-            }]
-        )
-        return {
-            "messages": [tool_call_msg],
-            "conversation_history": [tool_call_msg]
-        }
-    
     # 注意！！需要重新写prompt
     system_prompt=f"""
 你是一名拥有二十年从业经验的专业的股票研究员，负责搜集用户指定股票的市场数据。你收集到的数据会交给专业的分析师进行分析。
-用户意图：{state.get("intent", "unkonwn")}
+**重要日期说明**：
+- 今日日期是 {datetime.date.today().strftime("%Y-%m-%d")},不是2024年!
+用户提问：{state.get("user_query", "")}
+
+**当前状态**：
+- 已确定股票：{stock_name} ({stock_code}) 
+- 数据是否已采集：{data_available}
 
 **工作流程**：
-1. 分析用户输入，提取股票关键词或代码。若只有名称/关键词，先调用 `get_by_stock_keyword`或'get_by_stock_code' 获取候选股票。
-   - 如果工具返回多个匹配，系统会自动向用户询问选择，你无需处理。
-2. 获取到候选的股票代码与名称后调用 `fetch_data` 获取数据。
-   - 若用户未指定时间范围，使用默认日期（20250601-20260101）。
+1. 如果股票代码或名称未确定，先调用 `get_by_stock_keyword` 或 `get_by_stock_code` 确定股票。
+2. 一旦股票确定，**必须立即调用 `fetch_data` 工具**来获取数据。`fetch_data` 工具的参数：
+   - `symbol`：必填，股票代码。
+   - `start_date` 和 `end_date`：选填，若用户未指定，**不要传递这两个参数**，工具会自动使用最近两个月的日期。
+3. 获取到数据后，无需分析，只需回复“数据已准备完毕”。
 
 **重要原则**：
-- 若用户输入模糊或信息不足，主动向用户澄清。
-- 一次只进行一个操作，避免不必要的工具重复调用。
-- 工具返回错误时，尝试修正参数或请求用户协助，不要陷入无限重试。
-- 完成数据采集后，无需进一步分析，只需告知“XX(股票名称)的数据已准备完毕”。
+- 即使股票已经选定，你也必须主动调用 `fetch_data`，不能只输出文字。
+- 一次只进行一个工具调用，避免重复。
+- 工具返回错误时，尝试修正参数重试一次，若仍失败则告知用户。
 """
 
     messages = state.get("messages", [])
@@ -225,8 +216,20 @@ def update_state_from_tool(state: ResearcherState) -> dict:
 
         # 灵活映射：无论返回结构如何，尽量保存所有内容
         updates["collected_data"] = data
-        if "error" not in data:
-            updates["data_available"] = True
+
+        # 增强校验：若明确有 error 字段，或关键价格字段缺失，则标记为不可用
+        if "error" in data:
+            updates["data_available"] = False
+        else:
+            # 检查实时价格是否有效（可根据实际数据结构调整）
+            realtime = data.get("market_data", {}).get("realtime", {})
+            price = realtime.get("price")
+            # 不要求一定有日线数据
+            if price is None or price == 0:
+                print("[Researcher] 警告：未获取到有效价格数据")
+                updates["data_available"] = True
+            else:
+                updates["data_available"] = True
 
         # 同时尝试提取股票代码和名称（若 data 中包含）
         if "stock_code" in data:
@@ -234,7 +237,10 @@ def update_state_from_tool(state: ResearcherState) -> dict:
         if "stock_name" in data:
             updates["stock_name"] = data["stock_name"]
 
-        print("[Researcher] 数据采集完成，已更新状态。")
+        if updates["data_available"]:
+            print("[Researcher] 数据采集成功，已更新状态。")
+        else:
+            print("[Researcher] 数据采集失败，将尝试重试。")
         return updates
 
     # 处理股票查询工具，自动填充代码与名称
@@ -282,10 +288,13 @@ def update_state_from_tool(state: ResearcherState) -> dict:
             
             # 用户选择成功，生成一条简短的确认消息加入历史
             confirm_msg = AIMessage(content=f"已选择：{selected['name']} ({selected['code']})，正在获取数据……")
+            # 构造一条 HumanMessage，代表用户的选择结果，加入 messages 中供 LLM 理解
+            user_selection_msg = HumanMessage(content=f"我选择：{selected['name']} ({selected['code']})")
             return {
                 "stock_code": selected["code"],
                 "stock_name": selected["name"],
-                "conversation_history": [confirm_msg]   # ✅ 只写确认消息
+                "conversation_history": [confirm_msg],   # ✅ 只写确认消息
+                "messages": [user_selection_msg],   # 关键：更新 messages，让 LLM 知道选择已完成
             }
 
         elif "stock_code" in result and "stock_name" in result:
@@ -332,22 +341,24 @@ def should_continue(state: ResearcherState) -> Literal["tool_node", "__end__"]:
 def should_analysis_or_not(state: ResearcherState) -> Literal["llm", "__end__"]:
     """根据意图和当前状态决定下一步。"""
     intent = state.get("intent", "unknown")
+    data_available = state.get("data_available", False)
+    fetch_times = state.get("fetch_times", 0)
 
-    # 如果数据已成功获取，则结束研究员流程
-    if state.get("data_available", False):
+    # 数据已成功获取，结束研究员流程
+    if data_available:
         print("[Researcher] 数据已就绪，流程结束。")
         return END
 
-    # 对于只查价格的意图，可能只需要简单返回，但当前仍需数据采集
-    if intent == "price_check":
-        # 如果还没有代码或名称，需要继续询问LLM
-        if not state.get("stock_code") and not state.get("stock_name"):
+    # 数据未获取，检查是否还有重试机会
+    if fetch_times < 5:
+        # 如果还没有代码或名称，也需要继续（但此时可能由工具中断处理）
+        if intent == "price_check" or intent == "analyze_only" or intent == "full_advice":
+            # 如果有股票代码和名称但数据失败，可以重试 fetch_data
+            if state.get("stock_code") and state.get("stock_name"):
+                print("[Researcher] 数据采集失败，尝试重新调用 fetch_data")
+                return "llm"
+            # 否则可能还需要先确定股票，也返回 llm 让 LLM 决策
             return "llm"
-        return END
-
-    # 其他情况若数据未获取且未超过尝试次数，返回LLM继续
-    if state.get("fetch_times", 0) < 3:
-        return "llm"
     else:
         print("[Researcher] 数据获取失败且已达最大重试，流程终止。")
         return END

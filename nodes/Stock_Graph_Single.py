@@ -16,10 +16,12 @@ from langgraph.types import Command
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 import os
 import time
+import datetime
 
 from nodes.Researcher import Researcher_Agent
 from nodes.Analyst import Analyst_Graph
 from nodes.Advisor import Advisor_Graph
+from nodes.Responder import Responder_Graph
 from nodes.Supervisor import Supervisor_Graph
 
 
@@ -29,13 +31,9 @@ class InvestmentState(TypedDict):
     # 全局状态
     conversation_history: Annotated[List[BaseMessage], add_messages]
     # messages: Annotated[List[BaseMessage], add_messages]
+    history_query: Annotated[List[BaseMessage], add_messages]
     user_query: str
     intent: Literal["price_check", "analyze_only", "full_advice", "unknown"]
-    
-    # ----- Supervisor 流程控制字段 -----
-    needs_clarification: bool
-    clarification_question: str
-    current_phase: Literal["collecting", "analyzing", "reporting", "interrupted"]
     
     last_worker: Optional[WorkerType]
     next_worker: Optional[Union[WorkerType, Literal["__end__"]]]          # 可以是子图名或 "end"
@@ -51,11 +49,8 @@ class InvestmentState(TypedDict):
     # ----- 中间分析结果 -----
     analysis: str                        # Analyst 节点输出
     advices: Dict[str, Any]              # Advisor 节点输出
+    response: str                        # Responder 节点输出
 
-    # ----- 流程控制 -----
-    error_info: Optional[str]
-    retry_count: int
-    final_response: Optional[str]
     """
     collected_data 字段内部结构说明（类型为 Dict[str, Any] 时的参考）：
     {
@@ -107,6 +102,36 @@ def next_step_judgment(state: InvestmentState) -> str:
         print("==== 错误 ====\n找不到next_worker!")
         
 
+def Update_State(state:InvestmentState) -> str:
+    """
+    更新全局状态
+    """
+    current_query  = state.get("user_query","")
+    response_text = state.get("response", "")
+    stock_name = state.get("stock_name", "")
+    analysis_text = state.get("analysis","")
+    advices_text = state.get("advices","")
+
+    # 向 history_query 追加一条 HumanMessage（用于记录已处理的问题）
+    history_update = [HumanMessage(content=current_query)] if current_query else []
+    print(f"\n===关于{stock_name}的分析===\n{analysis_text}")
+    print(f"\n===关于{stock_name}的建议===\n{advices_text}")
+    print(f"================\n金融客服🤖：\n{response_text}")
+    return{
+        "history_query": history_update,
+        "user_query": "",                     # str，空字符串
+        "intent": "unknown",                  # Literal 成员
+        "last_worker": None,                  # Optional 可为 None
+        "next_worker": None,                  # Optional 可为 None
+        "stock_code": None,
+        "stock_name": None,
+        "collected_data": None,
+        "data_available": False,              # bool，设为 False
+        "analysis": "",                       # str，空字符串
+        "advices": {},                        # Dict，空字典
+        "response": "",                       # str，空字符串
+    }
+
 def Stock_Graph_Single() -> CompiledStateGraph:
     workflow = StateGraph(InvestmentState)
     
@@ -114,6 +139,8 @@ def Stock_Graph_Single() -> CompiledStateGraph:
     workflow.add_node("Researcher", Researcher_Agent())
     workflow.add_node("Analyst", Analyst_Graph())
     workflow.add_node("Advisor", Advisor_Graph())
+    workflow.add_node("Responder", Responder_Graph())
+    workflow.add_node("Update_State", Update_State)
 
     workflow.add_edge(START, "Supervisor")
     workflow.add_edge("Researcher", "Supervisor")
@@ -124,11 +151,15 @@ def Stock_Graph_Single() -> CompiledStateGraph:
         "Supervisor",              
         next_step_judgment
     )
+
+    workflow.add_edge("Responder", "Update_State")
+    workflow.add_edge("Update_State", END)
     checkpointer = MemorySaver()
     return workflow.compile(checkpointer = checkpointer)
 
 
 if __name__ == "__main__":
+    print(f"[Researcher] 系统提示中的今日日期: {datetime.date.today().strftime('%Y-%m-%d')}")
     Assistant = Stock_Graph_Single()
     config = {"configurable": {"thread_id": "user_session_123"}}
 

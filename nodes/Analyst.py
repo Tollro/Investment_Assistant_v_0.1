@@ -63,7 +63,9 @@ def create_llm(temperature: float) -> AzureChatOpenAI:
         api_key=os.getenv("AZURE_GPT4O_API_KEY"),
         api_version="2025-01-01-preview",
         model="gpt-4o",
-        temperature=temperature
+        temperature=temperature,
+        timeout=15,           # 请求超时（秒）
+        max_retries=4,   # 重试次数
     )
     if not llm:
         raise ValueError("Azure OpenAI 模型初始化失败，请检查环境变量设置。")
