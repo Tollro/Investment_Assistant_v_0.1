@@ -60,7 +60,7 @@ def SentenceTransformer(texts: Union[str, List[str]], batch_size: int = 32) -> U
 
 INTENT_EMBEDDINGS = {
     "price_check": SentenceTransformer("查询股票实时价格或报价或涨跌幅"),
-    "analyze_only": SentenceTransformer("分析股票走势或技术指标或K线形态，不需要投资建议"),
+    "analyze_only": SentenceTransformer("分析股票走势或技术指标或K线形态，股票分析，不需要投资建议"),
     "full_advice": SentenceTransformer("给出股票买入卖出建议或投资评级或持有还是抛售"),
 }
 
